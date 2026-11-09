@@ -19,7 +19,7 @@ command -v xcodegen >/dev/null 2>&1 || {
 }
 
 log "生成 Xcode 工程（XcodeGen）"
-xcodegen generate --spec "$ROOT/ios/project.yml" --project "$PROJECT"
+xcodegen generate --spec "$ROOT/ios/project.yml"
 
 EXTRA_SETTINGS=()
 if [ "$KERNEL_BACKEND" = "phoneme" ]; then
