@@ -1,0 +1,863 @@
+#include <stdlib.h>
+#include <string.h>
+
+#include "bda_audio.h"
+#include "bda_time.h"
+#include "kni.h"
+#include "platform/bbk9588/phoneme_audio.h"
+
+#define J2ME_AUDIO_RATE 22050u
+#define J2ME_AUDIO_BLOCK_BYTES 1024u
+#define J2ME_AUDIO_BLOCK_SAMPLES (J2ME_AUDIO_BLOCK_BYTES / 2u)
+#define J2ME_AUDIO_MAX_MEDIA_BYTES (512u * 1024u)
+#define J2ME_AUDIO_MAX_TRACKS 16u
+#define J2ME_AUDIO_MAX_VOICES 24u
+#define J2ME_AUDIO_KIND_MIDI 1
+#define J2ME_AUDIO_KIND_WAV 2
+#define J2ME_AUDIO_KIND_TONE 3
+
+typedef unsigned long long j2me_u64;
+
+typedef struct j2me_midi_track {
+    u32 position;
+    u32 end;
+    u32 next_tick;
+    u8 running_status;
+    u8 ended;
+} j2me_midi_track_t;
+
+typedef struct j2me_voice {
+    u32 phase;
+    u32 step;
+    int amplitude;
+    u8 channel;
+    u8 note;
+    u8 waveform;
+    u8 released;
+    u8 percussion;
+    u8 active;
+} j2me_voice_t;
+
+typedef struct j2me_audio_state {
+    u8 *data;
+    u32 data_length;
+    int kind;
+    int playing;
+    int device_open;
+    int original_attenuation;
+    int stop_pending;
+    int loops_left;
+    int volume;
+    int master_volume;
+    int master_muted;
+    int master_initialized;
+    u32 rendered_samples;
+    u32 next_pump_ms;
+
+    u16 midi_division;
+    u32 midi_tempo;
+    j2me_u64 midi_tick_q32;
+    j2me_u64 midi_tick_step_q32;
+    j2me_midi_track_t tracks[J2ME_AUDIO_MAX_TRACKS];
+    u32 track_count;
+    u8 channel_volume[16];
+    u8 channel_program[16];
+    j2me_voice_t voices[J2ME_AUDIO_MAX_VOICES];
+    u32 note_steps[128];
+    u32 noise;
+
+    u32 wav_data_offset;
+    u32 wav_data_bytes;
+    u32 wav_frame_count;
+    j2me_u64 wav_position_q16;
+    u32 wav_step_q16;
+    u16 wav_bits;
+    u16 wav_channels;
+
+    u32 tone_samples_left;
+
+    u32 start_count;
+    u32 midi_start_count;
+    u32 wav_start_count;
+    u32 tone_count;
+    u32 stop_count;
+    u32 note_count;
+    u32 write_count;
+    u32 write_bytes;
+    u32 write_errors;
+    u32 ready_misses;
+    u32 master_change_count;
+} j2me_audio_state_t;
+
+static j2me_audio_state_t g_audio;
+static u16 g_audio_pcm[J2ME_AUDIO_BLOCK_SAMPLES];
+
+static u16 audio_be16(const u8 *data) {
+    return (u16)(((u16)data[0] << 8) | data[1]);
+}
+
+static u32 audio_be32(const u8 *data) {
+    return ((u32)data[0] << 24) | ((u32)data[1] << 16) |
+        ((u32)data[2] << 8) | data[3];
+}
+
+static u16 audio_le16(const u8 *data) {
+    return (u16)((u16)data[0] | ((u16)data[1] << 8));
+}
+
+static u32 audio_le32(const u8 *data) {
+    return (u32)data[0] | ((u32)data[1] << 8) |
+        ((u32)data[2] << 16) | ((u32)data[3] << 24);
+}
+
+static int audio_fourcc(const u8 *data, const char *name) {
+    return data[0] == (u8)name[0] && data[1] == (u8)name[1] &&
+        data[2] == (u8)name[2] && data[3] == (u8)name[3];
+}
+
+static void audio_release_data(void) {
+    free(g_audio.data);
+    g_audio.data = NULL;
+    g_audio.data_length = 0u;
+}
+
+static void audio_initialize_master(void) {
+    if (!g_audio.master_initialized) {
+        g_audio.master_volume = 100;
+        g_audio.master_muted = 0;
+        g_audio.master_initialized = 1;
+    }
+}
+
+static void audio_close_device(void) {
+    if (!g_audio.device_open)
+        return;
+    if (bda_audio_ready()) {
+        memset(g_audio_pcm, 0, sizeof(g_audio_pcm));
+        bda_audio_set_attenuation((u32)g_audio.original_attenuation);
+        (void)bda_audio_write(g_audio_pcm, sizeof(g_audio_pcm));
+    }
+    bda_audio_stop();
+    g_audio.device_open = 0;
+    ++g_audio.stop_count;
+}
+
+static void audio_open_device(void) {
+    if (g_audio.device_open)
+        return;
+    audio_initialize_master();
+    g_audio.original_attenuation = bda_audio_get_attenuation();
+    bda_audio_open_pcm(BDA_AUDIO_SAMPLE_RATE_22050,
+        BDA_AUDIO_BITS_16, BDA_AUDIO_CHANNELS_MONO);
+    /* Games start at full hardware gain.  The overlay master control and
+     * MMAPI VolumeControl apply digitally; close restores the system value
+     * that was active before this PCM stream opened. */
+    bda_audio_set_attenuation(BDA_AUDIO_ATTENUATION_FULL_SCALE);
+    g_audio.device_open = 1;
+}
+
+void j2me_phoneme_audio_adjust_master_volume(int delta) {
+    int volume;
+    audio_initialize_master();
+    volume = g_audio.master_volume + delta;
+    if (volume < 0)
+        volume = 0;
+    else if (volume > 100)
+        volume = 100;
+    if (volume != g_audio.master_volume || g_audio.master_muted) {
+        g_audio.master_volume = volume;
+        g_audio.master_muted = 0;
+        ++g_audio.master_change_count;
+    }
+}
+
+void j2me_phoneme_audio_toggle_master_mute(void) {
+    audio_initialize_master();
+    g_audio.master_muted = !g_audio.master_muted;
+    ++g_audio.master_change_count;
+}
+
+unsigned int j2me_phoneme_audio_master_volume(void) {
+    audio_initialize_master();
+    return (unsigned int)g_audio.master_volume;
+}
+
+int j2me_phoneme_audio_master_muted(void) {
+    audio_initialize_master();
+    return g_audio.master_muted;
+}
+
+unsigned int j2me_phoneme_audio_master_change_count(void) {
+    return g_audio.master_change_count;
+}
+
+void j2me_phoneme_audio_stop(void) {
+    g_audio.playing = 0;
+    g_audio.stop_pending = 0;
+    g_audio.tone_samples_left = 0u;
+    g_audio.next_pump_ms = 0u;
+    memset(g_audio.voices, 0, sizeof(g_audio.voices));
+    audio_close_device();
+    audio_release_data();
+}
+
+static void audio_initialize_note_steps(void) {
+    int note;
+    if (g_audio.note_steps[69] != 0u)
+        return;
+    g_audio.note_steps[69] = (u32)(((j2me_u64)440u << 32) /
+        J2ME_AUDIO_RATE);
+    for (note = 70; note < 128; ++note)
+        g_audio.note_steps[note] = (u32)(((j2me_u64)
+            g_audio.note_steps[note - 1] * 69433u) >> 16);
+    for (note = 68; note >= 0; --note)
+        g_audio.note_steps[note] = (u32)(((j2me_u64)
+            g_audio.note_steps[note + 1] << 16) / 69433u);
+}
+
+static j2me_voice_t *audio_allocate_voice(void) {
+    u32 index;
+    j2me_voice_t *choice = &g_audio.voices[0];
+    for (index = 0u; index < J2ME_AUDIO_MAX_VOICES; ++index) {
+        j2me_voice_t *voice = &g_audio.voices[index];
+        if (!voice->active)
+            return voice;
+        if (voice->amplitude < choice->amplitude)
+            choice = voice;
+    }
+    return choice;
+}
+
+static void audio_note_on(u8 channel, u8 note, u8 velocity) {
+    j2me_voice_t *voice;
+    u8 program;
+    if (note >= 128u || velocity == 0u)
+        return;
+    voice = audio_allocate_voice();
+    program = g_audio.channel_program[channel & 15u];
+    memset(voice, 0, sizeof(*voice));
+    voice->active = 1u;
+    voice->channel = (u8)(channel & 15u);
+    voice->note = note;
+    voice->step = g_audio.note_steps[note];
+    voice->amplitude = (int)velocity *
+        (int)g_audio.channel_volume[channel & 15u] * 2;
+    if (voice->amplitude > 30000)
+        voice->amplitude = 30000;
+    voice->percussion = channel == 9u;
+    voice->released = voice->percussion;
+    voice->waveform = voice->percussion ? 3u : (u8)((program >> 4) % 3u);
+    ++g_audio.note_count;
+}
+
+static void audio_note_off(u8 channel, u8 note) {
+    u32 index;
+    for (index = 0u; index < J2ME_AUDIO_MAX_VOICES; ++index) {
+        j2me_voice_t *voice = &g_audio.voices[index];
+        if (voice->active && voice->channel == (channel & 15u) &&
+                voice->note == note)
+            voice->released = 1u;
+    }
+}
+
+static void audio_all_notes_off(u8 channel) {
+    u32 index;
+    for (index = 0u; index < J2ME_AUDIO_MAX_VOICES; ++index)
+        if (g_audio.voices[index].active &&
+                g_audio.voices[index].channel == (channel & 15u))
+            g_audio.voices[index].released = 1u;
+}
+
+static int midi_read_variable(j2me_midi_track_t *track, u32 *value) {
+    u32 result = 0u;
+    u32 count;
+    for (count = 0u; count < 4u; ++count) {
+        u8 byte;
+        if (track->position >= track->end)
+            return 0;
+        byte = g_audio.data[track->position++];
+        result = (result << 7) | (byte & 0x7fu);
+        if ((byte & 0x80u) == 0u) {
+            *value = result;
+            return 1;
+        }
+    }
+    return 0;
+}
+
+static int midi_prime_track(j2me_midi_track_t *track) {
+    u32 delta;
+    if (!midi_read_variable(track, &delta)) {
+        track->ended = 1u;
+        return 0;
+    }
+    track->next_tick = delta;
+    return 1;
+}
+
+static void midi_update_tick_step(void) {
+    j2me_u64 numerator = (j2me_u64)g_audio.midi_division * 1000000u;
+    numerator <<= 32;
+    g_audio.midi_tick_step_q32 = numerator /
+        ((j2me_u64)g_audio.midi_tempo * J2ME_AUDIO_RATE);
+    if (g_audio.midi_tick_step_q32 == 0u)
+        g_audio.midi_tick_step_q32 = 1u;
+}
+
+static int midi_parse_tracks(void) {
+    u32 position;
+    u32 wanted_tracks;
+    u32 found = 0u;
+    u32 index;
+    if (g_audio.data_length < 14u ||
+            !audio_fourcc(g_audio.data, "MThd"))
+        return 0;
+    position = 8u + audio_be32(g_audio.data + 4u);
+    wanted_tracks = audio_be16(g_audio.data + 10u);
+    g_audio.midi_division = audio_be16(g_audio.data + 12u);
+    if (position > g_audio.data_length || wanted_tracks == 0u ||
+            (g_audio.midi_division & 0x8000u) != 0u ||
+            g_audio.midi_division == 0u)
+        return 0;
+    if (wanted_tracks > J2ME_AUDIO_MAX_TRACKS)
+        wanted_tracks = J2ME_AUDIO_MAX_TRACKS;
+    memset(g_audio.tracks, 0, sizeof(g_audio.tracks));
+    while (position + 8u <= g_audio.data_length && found < wanted_tracks) {
+        u32 length = audio_be32(g_audio.data + position + 4u);
+        u32 data_position = position + 8u;
+        if (length > g_audio.data_length - data_position)
+            return 0;
+        if (audio_fourcc(g_audio.data + position, "MTrk")) {
+            j2me_midi_track_t *track = &g_audio.tracks[found++];
+            track->position = data_position;
+            track->end = data_position + length;
+            (void)midi_prime_track(track);
+        }
+        position = data_position + length;
+    }
+    if (found == 0u)
+        return 0;
+    g_audio.track_count = found;
+    g_audio.midi_tempo = 500000u;
+    g_audio.midi_tick_q32 = 0u;
+    midi_update_tick_step();
+    memset(g_audio.voices, 0, sizeof(g_audio.voices));
+    for (index = 0u; index < 16u; ++index) {
+        g_audio.channel_volume[index] = 100u;
+        g_audio.channel_program[index] = 0u;
+    }
+    return 1;
+}
+
+static void midi_end_track(j2me_midi_track_t *track) {
+    track->ended = 1u;
+    track->position = track->end;
+}
+
+static void midi_dispatch_track(j2me_midi_track_t *track) {
+    u8 status;
+    u8 first = 0u;
+    int have_first = 0;
+    u32 length;
+    if (track->position >= track->end) {
+        midi_end_track(track);
+        return;
+    }
+    status = g_audio.data[track->position++];
+    if (status < 0x80u) {
+        if (track->running_status < 0x80u) {
+            midi_end_track(track);
+            return;
+        }
+        first = status;
+        have_first = 1;
+        status = track->running_status;
+    } else if (status < 0xf0u) {
+        track->running_status = status;
+    }
+
+    if (status == 0xffu) {
+        u8 type;
+        if (track->position >= track->end) {
+            midi_end_track(track);
+            return;
+        }
+        type = g_audio.data[track->position++];
+        if (!midi_read_variable(track, &length) ||
+                length > track->end - track->position) {
+            midi_end_track(track);
+            return;
+        }
+        if (type == 0x51u && length == 3u) {
+            u32 tempo = ((u32)g_audio.data[track->position] << 16) |
+                ((u32)g_audio.data[track->position + 1u] << 8) |
+                g_audio.data[track->position + 2u];
+            if (tempo != 0u) {
+                g_audio.midi_tempo = tempo;
+                midi_update_tick_step();
+            }
+        }
+        track->position += length;
+        if (type == 0x2fu) {
+            midi_end_track(track);
+            return;
+        }
+    } else if (status == 0xf0u || status == 0xf7u) {
+        if (!midi_read_variable(track, &length) ||
+                length > track->end - track->position) {
+            midi_end_track(track);
+            return;
+        }
+        track->position += length;
+    } else if (status < 0xf0u) {
+        u8 command = (u8)(status & 0xf0u);
+        u8 channel = (u8)(status & 0x0fu);
+        u8 a;
+        u8 b = 0u;
+        int two = command != 0xc0u && command != 0xd0u;
+        if (have_first) {
+            a = first;
+        } else if (track->position < track->end) {
+            a = g_audio.data[track->position++];
+        } else {
+            midi_end_track(track);
+            return;
+        }
+        if (two) {
+            if (track->position >= track->end) {
+                midi_end_track(track);
+                return;
+            }
+            b = g_audio.data[track->position++];
+        }
+        if (command == 0x80u || (command == 0x90u && b == 0u))
+            audio_note_off(channel, a);
+        else if (command == 0x90u)
+            audio_note_on(channel, a, b);
+        else if (command == 0xb0u) {
+            if (a == 7u)
+                g_audio.channel_volume[channel] = b;
+            else if (a == 120u || a == 123u)
+                audio_all_notes_off(channel);
+        } else if (command == 0xc0u) {
+            g_audio.channel_program[channel] = a;
+        }
+    } else {
+        midi_end_track(track);
+        return;
+    }
+
+    if (!track->ended) {
+        u32 delta;
+        if (!midi_read_variable(track, &delta))
+            midi_end_track(track);
+        else
+            track->next_tick += delta;
+    }
+}
+
+static int midi_all_tracks_ended(void) {
+    u32 index;
+    for (index = 0u; index < g_audio.track_count; ++index)
+        if (!g_audio.tracks[index].ended)
+            return 0;
+    return 1;
+}
+
+static void midi_dispatch_due(void) {
+    u32 tick = (u32)(g_audio.midi_tick_q32 >> 32);
+    u32 index;
+    int dispatched;
+    do {
+        dispatched = 0;
+        for (index = 0u; index < g_audio.track_count; ++index) {
+            j2me_midi_track_t *track = &g_audio.tracks[index];
+            if (!track->ended && track->next_tick <= tick) {
+                midi_dispatch_track(track);
+                dispatched = 1;
+            }
+        }
+    } while (dispatched);
+
+    if (midi_all_tracks_ended()) {
+        if (g_audio.loops_left == -1 || g_audio.loops_left > 1) {
+            if (g_audio.loops_left > 1)
+                --g_audio.loops_left;
+            if (!midi_parse_tracks())
+                g_audio.playing = 0;
+        } else {
+            g_audio.playing = 0;
+        }
+    }
+}
+
+static int audio_voice_wave(j2me_voice_t *voice) {
+    u32 position = voice->phase >> 16;
+    int sample;
+    if (voice->waveform == 1u) {
+        sample = position < 32768u ? 32767 : -32768;
+    } else if (voice->waveform == 2u) {
+        sample = (int)position - 32768;
+    } else if (voice->waveform == 3u) {
+        u32 bit = ((g_audio.noise >> 0) ^ (g_audio.noise >> 2) ^
+            (g_audio.noise >> 3) ^ (g_audio.noise >> 5)) & 1u;
+        g_audio.noise = (g_audio.noise >> 1) | (bit << 31);
+        sample = (g_audio.noise & 1u) != 0u ? 32767 : -32768;
+    } else if (position < 32768u) {
+        sample = (int)position * 2 - 32768;
+    } else {
+        sample = 98303 - (int)position * 2;
+    }
+    voice->phase += voice->step;
+    return sample;
+}
+
+static int audio_render_voices(void) {
+    u32 index;
+    int mixed = 0;
+    for (index = 0u; index < J2ME_AUDIO_MAX_VOICES; ++index) {
+        j2me_voice_t *voice = &g_audio.voices[index];
+        int sample;
+        int decay;
+        if (!voice->active)
+            continue;
+        sample = audio_voice_wave(voice);
+        mixed += (sample * voice->amplitude) >> 15;
+        if (voice->percussion)
+            decay = (voice->amplitude >> 9) + 12;
+        else if (voice->released)
+            decay = (voice->amplitude >> 11) + 2;
+        else if (g_audio.channel_program[voice->channel] < 16u)
+            decay = (voice->amplitude >> 16) + 1;
+        else
+            decay = 0;
+        voice->amplitude -= decay;
+        if (voice->amplitude <= 0) {
+            voice->amplitude = 0;
+            voice->active = 0u;
+        }
+    }
+    mixed = (mixed * g_audio.volume) / 200;
+    if (mixed > 32767)
+        mixed = 32767;
+    else if (mixed < -32768)
+        mixed = -32768;
+    return mixed;
+}
+
+static int midi_render_sample(void) {
+    int sample;
+    midi_dispatch_due();
+    if (!g_audio.playing)
+        return 0;
+    sample = audio_render_voices();
+    g_audio.midi_tick_q32 += g_audio.midi_tick_step_q32;
+    return sample;
+}
+
+static int wav_parse(void) {
+    u32 position = 12u;
+    u16 format = 0u;
+    u16 channels = 0u;
+    u16 bits = 0u;
+    u32 rate = 0u;
+    u32 data_offset = 0u;
+    u32 data_bytes = 0u;
+    if (g_audio.data_length < 12u ||
+            !audio_fourcc(g_audio.data, "RIFF") ||
+            !audio_fourcc(g_audio.data + 8u, "WAVE"))
+        return 0;
+    while (position + 8u <= g_audio.data_length) {
+        u32 length = audio_le32(g_audio.data + position + 4u);
+        u32 content = position + 8u;
+        if (length > g_audio.data_length - content)
+            return 0;
+        if (audio_fourcc(g_audio.data + position, "fmt ") && length >= 16u) {
+            format = audio_le16(g_audio.data + content);
+            channels = audio_le16(g_audio.data + content + 2u);
+            rate = audio_le32(g_audio.data + content + 4u);
+            bits = audio_le16(g_audio.data + content + 14u);
+        } else if (audio_fourcc(g_audio.data + position, "data")) {
+            data_offset = content;
+            data_bytes = length;
+        }
+        position = content + length + (length & 1u);
+    }
+    if (format != 1u || (channels != 1u && channels != 2u) ||
+            (bits != 8u && bits != 16u) || rate < 4000u ||
+            rate > 48000u || data_bytes == 0u)
+        return 0;
+    g_audio.wav_data_offset = data_offset;
+    g_audio.wav_data_bytes = data_bytes;
+    g_audio.wav_bits = bits;
+    g_audio.wav_channels = channels;
+    g_audio.wav_frame_count = data_bytes /
+        ((u32)channels * ((u32)bits / 8u));
+    g_audio.wav_position_q16 = 0u;
+    g_audio.wav_step_q16 = (u32)(((j2me_u64)rate << 16) /
+        J2ME_AUDIO_RATE);
+    return g_audio.wav_frame_count != 0u && g_audio.wav_step_q16 != 0u;
+}
+
+static int wav_source_sample(u32 frame) {
+    u32 bytes_per_sample = (u32)g_audio.wav_bits / 8u;
+    u32 offset = g_audio.wav_data_offset + frame *
+        bytes_per_sample * (u32)g_audio.wav_channels;
+    int left;
+    int right;
+    if (g_audio.wav_bits == 8u) {
+        left = ((int)g_audio.data[offset] - 128) << 8;
+        right = g_audio.wav_channels == 2u ?
+            ((int)g_audio.data[offset + 1u] - 128) << 8 : left;
+    } else {
+        left = (short)audio_le16(g_audio.data + offset);
+        right = g_audio.wav_channels == 2u ?
+            (short)audio_le16(g_audio.data + offset + 2u) : left;
+    }
+    return (left + right) / 2;
+}
+
+static int wav_render_sample(void) {
+    u32 frame = (u32)(g_audio.wav_position_q16 >> 16);
+    int sample;
+    if (frame >= g_audio.wav_frame_count) {
+        if (g_audio.loops_left == -1 || g_audio.loops_left > 1) {
+            if (g_audio.loops_left > 1)
+                --g_audio.loops_left;
+            g_audio.wav_position_q16 = 0u;
+            frame = 0u;
+        } else {
+            g_audio.playing = 0;
+            return 0;
+        }
+    }
+    sample = wav_source_sample(frame);
+    g_audio.wav_position_q16 += g_audio.wav_step_q16;
+    return (sample * g_audio.volume) / 100;
+}
+
+static int tone_render_sample(void) {
+    int sample;
+    if (g_audio.tone_samples_left == 0u) {
+        g_audio.playing = 0;
+        return 0;
+    }
+    sample = audio_render_voices();
+    --g_audio.tone_samples_left;
+    if (g_audio.tone_samples_left == 0u)
+        g_audio.voices[0].released = 1u;
+    return sample;
+}
+
+static int audio_start_owned(u8 *data, u32 length, int kind,
+        int loops, int volume) {
+    j2me_phoneme_audio_stop();
+    g_audio.data = data;
+    g_audio.data_length = length;
+    g_audio.kind = kind;
+    g_audio.loops_left = loops;
+    g_audio.volume = volume;
+    g_audio.rendered_samples = 0u;
+    g_audio.noise = 0x13579bdfu;
+    audio_initialize_note_steps();
+    if (kind == J2ME_AUDIO_KIND_MIDI) {
+        if (!midi_parse_tracks()) {
+            audio_release_data();
+            return 0;
+        }
+        ++g_audio.midi_start_count;
+    } else if (kind == J2ME_AUDIO_KIND_WAV) {
+        if (!wav_parse()) {
+            audio_release_data();
+            return 0;
+        }
+        ++g_audio.wav_start_count;
+    } else {
+        audio_release_data();
+        return 0;
+    }
+    g_audio.playing = 1;
+    ++g_audio.start_count;
+    return 1;
+}
+
+static void audio_play_tone(int note, int duration, int volume) {
+    j2me_voice_t *voice;
+    j2me_phoneme_audio_stop();
+    audio_initialize_note_steps();
+    g_audio.kind = J2ME_AUDIO_KIND_TONE;
+    g_audio.volume = volume;
+    g_audio.channel_volume[0] = 100u;
+    g_audio.channel_program[0] = 0u;
+    voice = &g_audio.voices[0];
+    memset(voice, 0, sizeof(*voice));
+    voice->active = 1u;
+    voice->note = (u8)note;
+    voice->step = g_audio.note_steps[note];
+    voice->amplitude = 26000;
+    g_audio.tone_samples_left = (u32)(((j2me_u64)(u32)duration *
+        J2ME_AUDIO_RATE) / 1000u);
+    if (g_audio.tone_samples_left == 0u)
+        g_audio.tone_samples_left = 1u;
+    g_audio.rendered_samples = 0u;
+    g_audio.playing = 1;
+    ++g_audio.tone_count;
+    ++g_audio.start_count;
+}
+
+void j2me_phoneme_audio_pump(void) {
+    u32 index;
+    u32 now;
+    int written;
+    if (g_audio.stop_pending) {
+        g_audio.stop_pending = 0;
+        audio_close_device();
+    }
+    if (!g_audio.playing)
+        return;
+    now = bda_gui_millisecond_count();
+    if ((s32)(now - g_audio.next_pump_ms) < 0)
+        return;
+    /* One PCM block represents 23.2 ms.  Polling every VM event-loop spin
+     * used to call the firmware ready service hundreds of thousands of times
+     * per second; a 5 ms cadence remains comfortably below one block while
+     * keeping the raw-message/event path nonblocking. */
+    g_audio.next_pump_ms = now + 5u;
+    audio_open_device();
+    if (!bda_audio_ready()) {
+        ++g_audio.ready_misses;
+        return;
+    }
+    for (index = 0u; index < J2ME_AUDIO_BLOCK_SAMPLES; ++index) {
+        int sample;
+        if (g_audio.kind == J2ME_AUDIO_KIND_MIDI)
+            sample = midi_render_sample();
+        else if (g_audio.kind == J2ME_AUDIO_KIND_WAV)
+            sample = wav_render_sample();
+        else
+            sample = tone_render_sample();
+        audio_initialize_master();
+        if (g_audio.master_muted)
+            sample = 0;
+        else
+            sample = (sample * g_audio.master_volume) / 100;
+        g_audio_pcm[index] = (u16)(short)sample;
+        ++g_audio.rendered_samples;
+        if (!g_audio.playing) {
+            ++index;
+            while (index < J2ME_AUDIO_BLOCK_SAMPLES)
+                g_audio_pcm[index++] = 0u;
+            break;
+        }
+    }
+    written = bda_audio_write(g_audio_pcm, sizeof(g_audio_pcm));
+    ++g_audio.write_count;
+    if (written == (int)sizeof(g_audio_pcm))
+        g_audio.write_bytes += sizeof(g_audio_pcm);
+    else
+        ++g_audio.write_errors;
+    if (!g_audio.playing)
+        g_audio.stop_pending = 1;
+}
+
+unsigned int j2me_phoneme_audio_start_count(void) {
+    return g_audio.start_count;
+}
+
+unsigned int j2me_phoneme_audio_midi_start_count(void) {
+    return g_audio.midi_start_count;
+}
+
+unsigned int j2me_phoneme_audio_wav_start_count(void) {
+    return g_audio.wav_start_count;
+}
+
+unsigned int j2me_phoneme_audio_tone_count(void) {
+    return g_audio.tone_count;
+}
+
+unsigned int j2me_phoneme_audio_stop_count(void) {
+    return g_audio.stop_count;
+}
+
+unsigned int j2me_phoneme_audio_note_count(void) {
+    return g_audio.note_count;
+}
+
+unsigned int j2me_phoneme_audio_write_count(void) {
+    return g_audio.write_count;
+}
+
+unsigned int j2me_phoneme_audio_write_bytes(void) {
+    return g_audio.write_bytes;
+}
+
+unsigned int j2me_phoneme_audio_write_errors(void) {
+    return g_audio.write_errors;
+}
+
+unsigned int j2me_phoneme_audio_ready_misses(void) {
+    return g_audio.ready_misses;
+}
+
+KNIEXPORT KNI_RETURNTYPE_VOID
+Java_javax_microedition_media_BBK9588Player_playTone(void) {
+    int volume = KNI_GetParameterAsInt(3);
+    int duration = KNI_GetParameterAsInt(2);
+    int note = KNI_GetParameterAsInt(1);
+    if (note >= 0 && note < 128 && duration > 0 && volume > 0)
+        audio_play_tone(note, duration, volume > 100 ? 100 : volume);
+    KNI_ReturnVoid();
+}
+
+KNIEXPORT KNI_RETURNTYPE_BOOLEAN
+Java_javax_microedition_media_BBK9588Player_nativeStart(void) {
+    int volume = KNI_GetParameterAsInt(4);
+    int loops = KNI_GetParameterAsInt(3);
+    int kind = KNI_GetParameterAsInt(2);
+    u8 *copy = NULL;
+    int result = 0;
+    KNI_StartHandles(1);
+    KNI_DeclareHandle(data);
+    KNI_GetParameterAsObject(1, data);
+    if (!KNI_IsNullHandle(data)) {
+        int length = KNI_GetArrayLength(data);
+        if (length > 0 && (u32)length <= J2ME_AUDIO_MAX_MEDIA_BYTES) {
+            copy = (u8 *)malloc((size_t)length);
+            if (copy != NULL) {
+                KNI_GetRawArrayRegion(data, 0, length, (jbyte *)copy);
+                result = audio_start_owned(copy, (u32)length, kind,
+                    loops, volume < 0 ? 0 : (volume > 100 ? 100 : volume));
+                if (!result)
+                    copy = NULL;
+            }
+        }
+    }
+    KNI_EndHandles();
+    KNI_ReturnBoolean(result ? KNI_TRUE : KNI_FALSE);
+}
+
+KNIEXPORT KNI_RETURNTYPE_VOID
+Java_javax_microedition_media_BBK9588Player_nativeStop(void) {
+    j2me_phoneme_audio_stop();
+    KNI_ReturnVoid();
+}
+
+KNIEXPORT KNI_RETURNTYPE_VOID
+Java_javax_microedition_media_BBK9588Player_nativeSetVolume(void) {
+    int volume = KNI_GetParameterAsInt(1);
+    g_audio.volume = volume < 0 ? 0 : (volume > 100 ? 100 : volume);
+    KNI_ReturnVoid();
+}
+
+KNIEXPORT KNI_RETURNTYPE_BOOLEAN
+Java_javax_microedition_media_BBK9588Player_nativeIsPlaying(void) {
+    KNI_ReturnBoolean(g_audio.playing ? KNI_TRUE : KNI_FALSE);
+}
+
+KNIEXPORT KNI_RETURNTYPE_LONG
+Java_javax_microedition_media_BBK9588Player_nativeMediaTime(void) {
+    jlong value = (jlong)(((j2me_u64)g_audio.rendered_samples * 1000000u) /
+        J2ME_AUDIO_RATE);
+    KNI_ReturnLong(value);
+}

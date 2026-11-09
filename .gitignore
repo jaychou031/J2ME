@@ -1,0 +1,28 @@
+# 构建产物
+build/
+.deps/
+DerivedData/
+*.ipa
+*.app/
+*.dSYM/
+*.o
+*.a
+
+# Xcode / XcodeGen
+*.xcodeproj/
+*.xcworkspace/
+xcuserdata/
+*.xcuserstate
+*.moved-aside
+
+# macOS / 编辑器
+.DS_Store
+*.swp
+.idea/
+.vscode/
+
+# Python / 本地测试
+__pycache__/
+*.pyc
+frame.raw
+frame_*.png

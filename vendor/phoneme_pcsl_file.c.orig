@@ -1,0 +1,720 @@
+#include <stddef.h>
+#include <stdlib.h>
+#include <string.h>
+
+#include "bda_sdk.h"
+#include "pcsl_directory.h"
+#include "pcsl_file.h"
+#include "pcsl_string.h"
+#include "platform/bbk9588/phoneme_bbk9588_port.h"
+
+#define pcsl_mem_malloc malloc
+#define pcsl_mem_calloc calloc
+#define pcsl_mem_free free
+
+#define PHONEME_PCSL_PATH_CAPACITY 512u
+#define PHONEME_GAME_JAR_CACHE_MAX (2L * 1024L * 1024L)
+#define PHONEME_BDA_FS_REMOVE_OFFSET 0x024u
+#define PHONEME_FIND_ATTR_ALL 0x27u
+
+typedef struct phoneme_pcsl_file_handle {
+    int file;
+    int flags;
+    const unsigned char *memory;
+    long memory_size;
+    long memory_position;
+    char path[PHONEME_PCSL_PATH_CAPACITY];
+} phoneme_pcsl_file_handle_t;
+
+typedef struct phoneme_pcsl_file_list {
+    bda_fs_find_data_t find;
+    int first_pending;
+    int open;
+    char root[PHONEME_PCSL_PATH_CAPACITY];
+} phoneme_pcsl_file_list_t;
+
+static unsigned char *g_game_jar_cache;
+static long g_game_jar_cache_size;
+static char g_game_jar_cache_path[PHONEME_PCSL_PATH_CAPACITY];
+
+static unsigned int read_u16le(const unsigned char *at) {
+    return (unsigned int)at[0] | ((unsigned int)at[1] << 8);
+}
+
+static unsigned long read_u32le(const unsigned char *at) {
+    return (unsigned long)at[0] | ((unsigned long)at[1] << 8) |
+        ((unsigned long)at[2] << 16) | ((unsigned long)at[3] << 24);
+}
+
+static void write_u16le(unsigned char *at, unsigned int value) {
+    at[0] = (unsigned char)value;
+    at[1] = (unsigned char)(value >> 8);
+}
+
+static void write_u32le(unsigned char *at, unsigned long value) {
+    at[0] = (unsigned char)value;
+    at[1] = (unsigned char)(value >> 8);
+    at[2] = (unsigned char)(value >> 16);
+    at[3] = (unsigned char)(value >> 24);
+}
+
+/*
+ * JARs made by older desktop Java tools commonly put sizes in a 16-byte data
+ * descriptor after every compressed member.  phoneME's small KVM ZIP reader
+ * accepts the central directory but later walks local members as if the
+ * descriptor were absent.  Compact a cached JAR into the equivalent classic
+ * layout: populate local sizes, remove descriptors, and fix central offsets.
+ * No game class or resource bytes are changed.
+ */
+static int normalize_game_jar(unsigned char **data_ptr, long *size_ptr) {
+    unsigned char *source = *data_ptr;
+    unsigned char *output;
+    unsigned long *local_offsets;
+    unsigned long size = (unsigned long)*size_ptr;
+    unsigned long eocd;
+    unsigned long search_start;
+    unsigned long central_offset;
+    unsigned long central_size;
+    unsigned long central_position;
+    unsigned long output_position;
+    unsigned long output_central;
+    unsigned long output_eocd;
+    unsigned long tail_size;
+    unsigned long local_offset;
+    unsigned long previous_local_offset = 0u;
+    unsigned long compressed_size;
+    unsigned long record_size;
+    unsigned long local_size;
+    unsigned int entries;
+    unsigned int name_size;
+    unsigned int extra_size;
+    unsigned int comment_size;
+    unsigned int flags;
+    unsigned int index;
+    int needs_normalization = 0;
+
+    if (size < 22u)
+        return 0;
+    search_start = size > 65557u ? size - 65557u : 0u;
+    eocd = size - 22u;
+    for (;;) {
+        if (source[eocd] == 'P' && source[eocd + 1u] == 'K' &&
+                source[eocd + 2u] == 5u && source[eocd + 3u] == 6u)
+            break;
+        if (eocd == search_start)
+            return 0;
+        --eocd;
+    }
+    entries = read_u16le(source + eocd + 10u);
+    central_size = read_u32le(source + eocd + 12u);
+    central_offset = read_u32le(source + eocd + 16u);
+    if (entries == 0u || central_offset > eocd ||
+            central_size > eocd - central_offset)
+        return 0;
+    local_offsets = (unsigned long *)malloc(entries * sizeof(*local_offsets));
+    output = (unsigned char *)malloc(size);
+    if (local_offsets == NULL || output == NULL) {
+        if (local_offsets != NULL) free(local_offsets);
+        if (output != NULL) free(output);
+        return 0;
+    }
+    central_position = central_offset;
+    output_position = 0u;
+    for (index = 0u; index < entries; ++index) {
+        if (central_position + 46u > eocd ||
+                memcmp(source + central_position, "PK\001\002", 4u) != 0)
+            goto failed;
+        flags = read_u16le(source + central_position + 8u);
+        compressed_size = read_u32le(source + central_position + 20u);
+        name_size = read_u16le(source + central_position + 28u);
+        extra_size = read_u16le(source + central_position + 30u);
+        comment_size = read_u16le(source + central_position + 32u);
+        local_offset = read_u32le(source + central_position + 42u);
+        record_size = 46u + name_size + extra_size + comment_size;
+        if (record_size > eocd - central_position ||
+                local_offset + 30u > central_offset ||
+                memcmp(source + local_offset, "PK\003\004", 4u) != 0)
+            goto failed;
+        local_size = 30u + read_u16le(source + local_offset + 26u) +
+            read_u16le(source + local_offset + 28u) + compressed_size;
+        if (local_size > central_offset - local_offset ||
+                (index != 0u && local_offset < previous_local_offset))
+            goto failed;
+        previous_local_offset = local_offset;
+        if (index == 0u && local_offset != 0u) {
+            memcpy(output, source, local_offset);
+            output_position = local_offset;
+        }
+        if (output_position + local_size > size)
+            goto failed;
+        memcpy(output + output_position, source + local_offset, local_size);
+        local_offsets[index] = output_position;
+        flags &= ~8u;
+        write_u16le(output + output_position + 6u, flags);
+        memcpy(output + output_position + 14u,
+            source + central_position + 16u, 12u);
+        output_position += local_size;
+        central_position += record_size;
+        if ((read_u16le(source + central_position - record_size + 8u) & 8u)
+                != 0u)
+            needs_normalization = 1;
+    }
+    if (!needs_normalization) {
+        free(local_offsets);
+        free(output);
+        return 0;
+    }
+    output_central = output_position;
+    central_position = central_offset;
+    for (index = 0u; index < entries; ++index) {
+        name_size = read_u16le(source + central_position + 28u);
+        extra_size = read_u16le(source + central_position + 30u);
+        comment_size = read_u16le(source + central_position + 32u);
+        record_size = 46u + name_size + extra_size + comment_size;
+        memcpy(output + output_position, source + central_position,
+            record_size);
+        flags = read_u16le(output + output_position + 8u) & ~8u;
+        write_u16le(output + output_position + 8u, flags);
+        write_u32le(output + output_position + 42u, local_offsets[index]);
+        output_position += record_size;
+        central_position += record_size;
+    }
+    output_eocd = output_position;
+    tail_size = size - eocd;
+    if (output_eocd + tail_size > size)
+        goto failed;
+    memcpy(output + output_eocd, source + eocd, tail_size);
+    write_u32le(output + output_eocd + 12u, output_position - output_central);
+    write_u32le(output + output_eocd + 16u, output_central);
+    output_position += tail_size;
+    free(local_offsets);
+    free(source);
+    *data_ptr = output;
+    *size_ptr = (long)output_position;
+    return 1;
+
+failed:
+    free(local_offsets);
+    free(output);
+    return 0;
+}
+
+/* The BDA launcher overrides this weak hook so the ASCII VM alias can point
+ * at a firmware-selected path whose bytes are encoded in GBK. */
+__attribute__((weak))
+const char *j2me_phoneme_bbk9588_resolve_path(const char *path) {
+    return path;
+}
+
+static int append_gbk(char *out, unsigned int capacity, unsigned int *used,
+    unsigned int first, unsigned int second) {
+    if (*used + (second != 0u ? 2u : 1u) >= capacity)
+        return 0;
+    out[(*used)++] = (char)first;
+    if (second != 0u)
+        out[(*used)++] = (char)second;
+    return 1;
+}
+
+/* The runtime and its generated RMS names are ASCII.  Four non-ASCII
+ * characters occur in the requested system root A:/应用/数据/J2ME; encode
+ * those explicitly for the 9588 firmware's GBK file API. */
+static int pcsl_path_to_bda(const pcsl_string *source, char *out,
+    unsigned int capacity) {
+    const jchar *chars;
+    int length;
+    int i;
+    unsigned int used = 0u;
+    if (source == NULL || out == NULL || capacity == 0u)
+        return 0;
+    chars = pcsl_string_get_utf16_data(source);
+    length = pcsl_string_length(source);
+    if (chars == NULL || length < 0)
+        return 0;
+    for (i = 0; i < length; ++i) {
+        unsigned int ch = (unsigned int)chars[i];
+        if (ch <= 0x7fu) {
+            if (!append_gbk(out, capacity, &used,
+                    ch == '/' ? '\\' : ch, 0u))
+                return 0;
+        } else if (ch == 0x5e94u) {
+            if (!append_gbk(out, capacity, &used, 0xd3u, 0xa6u)) return 0;
+        } else if (ch == 0x7528u) {
+            if (!append_gbk(out, capacity, &used, 0xd3u, 0xc3u)) return 0;
+        } else if (ch == 0x6570u) {
+            if (!append_gbk(out, capacity, &used, 0xcau, 0xfdu)) return 0;
+        } else if (ch == 0x636eu) {
+            if (!append_gbk(out, capacity, &used, 0xbeu, 0xddu)) return 0;
+        } else {
+            return 0;
+        }
+    }
+    out[used] = '\0';
+    return 1;
+}
+
+static const char *resolve_pcsl_path(const pcsl_string *source, char *path,
+    unsigned int capacity) {
+    const char *resolved;
+    if (!pcsl_path_to_bda(source, path, capacity))
+        return NULL;
+    resolved = j2me_phoneme_bbk9588_resolve_path(path);
+    return resolved != NULL ? resolved : path;
+}
+
+static const char *mode_for_flags(int flags) {
+    int access = flags & 3;
+    if ((flags & PCSL_FILE_O_APPEND) != 0)
+        return access == PCSL_FILE_O_WRONLY ? "ab" : "a+b";
+    if ((flags & PCSL_FILE_O_TRUNC) != 0)
+        return access == PCSL_FILE_O_WRONLY ? "wb" : "w+b";
+    if (access == PCSL_FILE_O_RDONLY)
+        return "rb";
+    if ((flags & PCSL_FILE_O_CREAT) != 0)
+        return "a+b";
+    return "r+b";
+}
+
+static int copy_path(char *out, unsigned int capacity, const char *path) {
+    unsigned int length;
+    if (out == NULL || path == NULL)
+        return 0;
+    length = (unsigned int)strlen(path);
+    if (length >= capacity)
+        return 0;
+    memcpy(out, path, length + 1u);
+    return 1;
+}
+
+int pcsl_file_init(void) {
+    /* storageInitialize() has just initialized the string module. Some old
+     * phoneME PCSL builds do not maintain the optional active-state flag, so
+     * treating that diagnostic flag as a hard dependency rejects a healthy
+     * freestanding port before any file operation is attempted. */
+    return 0;
+}
+
+int pcsl_file_finalize(void) {
+    if (g_game_jar_cache != NULL) {
+        pcsl_mem_free(g_game_jar_cache);
+        g_game_jar_cache = NULL;
+        g_game_jar_cache_size = 0;
+        g_game_jar_cache_path[0] = '\0';
+    }
+    return 0;
+}
+
+static int cache_game_jar(const char *path) {
+    unsigned char *buffer;
+    long size;
+    long total;
+    int file;
+    int count;
+    u32 request;
+    if (g_game_jar_cache != NULL &&
+            strcmp(g_game_jar_cache_path, path) == 0)
+        return 1;
+    file = bda_fs_fopen_raw(path, "rb");
+    if (!bda_fs_file_is_valid(file))
+        return 0;
+    size = bda_fs_seek_raw(file, 0, BDA_SEEK_END);
+    if (size <= 0 || size > PHONEME_GAME_JAR_CACHE_MAX ||
+            bda_fs_seek_raw(file, 0, BDA_SEEK_SET) != 0) {
+        (void)bda_fs_close_raw(file);
+        return 0;
+    }
+    buffer = (unsigned char *)pcsl_mem_malloc((unsigned long)size);
+    if (buffer == NULL) {
+        (void)bda_fs_close_raw(file);
+        return 0;
+    }
+    total = 0;
+    while (total < size) {
+        request = (u32)(size - total);
+        if (request > 4096u)
+            request = 4096u;
+        count = bda_fs_read_raw(file, buffer + total,
+            request);
+        if (count <= 0)
+            break;
+        total += count;
+    }
+    (void)bda_fs_close_raw(file);
+    if (total != size || !copy_path(g_game_jar_cache_path,
+            sizeof(g_game_jar_cache_path), path)) {
+        pcsl_mem_free(buffer);
+        return 0;
+    }
+    (void)normalize_game_jar(&buffer, &size);
+    if (g_game_jar_cache != NULL)
+        pcsl_mem_free(g_game_jar_cache);
+    g_game_jar_cache = buffer;
+    g_game_jar_cache_size = size;
+    return 1;
+}
+
+int pcsl_file_open(const pcsl_string *fileName, int flags, void **handle) {
+    phoneme_pcsl_file_handle_t *result;
+    char converted[PHONEME_PCSL_PATH_CAPACITY];
+    const char *path;
+    int file;
+    int is_game_jar;
+    if (handle == NULL)
+        return -1;
+    *handle = NULL;
+    if (!pcsl_path_to_bda(fileName, converted, sizeof(converted)))
+        return -1;
+    is_game_jar = strcmp(converted, J2ME_PHONEME_JAR_ALIAS) == 0 &&
+        (flags & 3) == PCSL_FILE_O_RDONLY;
+    path = j2me_phoneme_bbk9588_resolve_path(converted);
+    if (path == NULL)
+        path = converted;
+    if (path == NULL)
+        return -1;
+    result = (phoneme_pcsl_file_handle_t *)pcsl_mem_calloc(1u,
+        sizeof(*result));
+    if (result == NULL || !copy_path(result->path, sizeof(result->path), path)) {
+        if (result != NULL) pcsl_mem_free(result);
+        return -1;
+    }
+    result->flags = flags;
+    if (is_game_jar && cache_game_jar(path)) {
+        result->memory = g_game_jar_cache;
+        result->memory_size = g_game_jar_cache_size;
+        *handle = result;
+        return 0;
+    }
+    file = bda_fs_fopen_raw(path, mode_for_flags(flags));
+    if (!bda_fs_file_is_valid(file) &&
+        (flags & PCSL_FILE_O_CREAT) != 0 &&
+        (flags & PCSL_FILE_O_TRUNC) == 0)
+        file = bda_fs_fopen_raw(path,
+            (flags & 3) == PCSL_FILE_O_WRONLY ? "wb" : "w+b");
+    if (!bda_fs_file_is_valid(file)) {
+        pcsl_mem_free(result);
+        return -1;
+    }
+    result->file = file;
+    if ((flags & PCSL_FILE_O_APPEND) != 0)
+        (void)bda_fs_seek_raw(file, 0, BDA_SEEK_END);
+    *handle = result;
+    return 0;
+}
+
+int pcsl_file_close(void *handle) {
+    phoneme_pcsl_file_handle_t *file = (phoneme_pcsl_file_handle_t *)handle;
+    int result;
+    if (file == NULL)
+        return -1;
+    result = file->memory != NULL ? 0 : bda_fs_close_raw(file->file);
+    pcsl_mem_free(file);
+    return result;
+}
+
+int pcsl_file_read(void *handle, unsigned char *buf, long size) {
+    phoneme_pcsl_file_handle_t *file = (phoneme_pcsl_file_handle_t *)handle;
+    long remaining;
+    if (file == NULL || buf == NULL || size < 0)
+        return -1;
+    if (file->memory != NULL) {
+        remaining = file->memory_size - file->memory_position;
+        if (size > remaining)
+            size = remaining;
+        if (size > 0) {
+            memcpy(buf, file->memory + file->memory_position,
+                (unsigned long)size);
+            file->memory_position += size;
+        }
+        return (int)size;
+    }
+    return bda_fs_read_raw(file->file, buf, (u32)size);
+}
+
+int pcsl_file_write(void *handle, unsigned char *buf, long size) {
+    phoneme_pcsl_file_handle_t *file = (phoneme_pcsl_file_handle_t *)handle;
+    if (file == NULL || buf == NULL || size < 0)
+        return -1;
+    if (file->memory != NULL)
+        return -1;
+    if ((file->flags & PCSL_FILE_O_APPEND) != 0)
+        (void)bda_fs_seek_raw(file->file, 0, BDA_SEEK_END);
+    return bda_fs_write_raw(file->file, buf, (u32)size);
+}
+
+static int remove_bda_path(const char *path) {
+    return bda_sdk_internal_call1(bda_sdk_internal_fs(),
+        PHONEME_BDA_FS_REMOVE_OFFSET, (u32)path);
+}
+
+int pcsl_file_unlink(const pcsl_string *fileName) {
+    char converted[PHONEME_PCSL_PATH_CAPACITY];
+    const char *path = resolve_pcsl_path(fileName, converted, sizeof(converted));
+    return path != NULL ? remove_bda_path(path) : -1;
+}
+
+int pcsl_file_truncate(void *handle, long size) {
+    phoneme_pcsl_file_handle_t *file = (phoneme_pcsl_file_handle_t *)handle;
+    int replacement;
+    if (file == NULL || file->memory != NULL || size != 0)
+        return -1;
+    (void)bda_fs_close_raw(file->file);
+    replacement = bda_fs_fopen_raw(file->path, "w+b");
+    if (!bda_fs_file_is_valid(replacement))
+        return -1;
+    file->file = replacement;
+    return 0;
+}
+
+long pcsl_file_seek(void *handle, long offset, long position) {
+    phoneme_pcsl_file_handle_t *file = (phoneme_pcsl_file_handle_t *)handle;
+    long base;
+    long target;
+    if (file == NULL || position < BDA_SEEK_SET || position > BDA_SEEK_END)
+        return -1;
+    if (file->memory != NULL) {
+        base = position == BDA_SEEK_SET ? 0 :
+            (position == BDA_SEEK_CUR ? file->memory_position :
+                file->memory_size);
+        target = base + offset;
+        if (target < 0 || target > file->memory_size)
+            return -1;
+        file->memory_position = target;
+        return target;
+    }
+    return bda_fs_seek_raw(file->file, (s32)offset, position);
+}
+
+long pcsl_file_sizeofopenfile(void *handle) {
+    phoneme_pcsl_file_handle_t *file = (phoneme_pcsl_file_handle_t *)handle;
+    int current;
+    int size;
+    if (file == NULL)
+        return -1;
+    if (file->memory != NULL)
+        return file->memory_size;
+    current = bda_fs_tell_raw(file->file);
+    size = bda_fs_seek_raw(file->file, 0, BDA_SEEK_END);
+    if (current >= 0)
+        (void)bda_fs_seek_raw(file->file, current, BDA_SEEK_SET);
+    return size;
+}
+
+long pcsl_file_sizeof(const pcsl_string *fileName) {
+    void *handle = NULL;
+    long result;
+    if (pcsl_file_open(fileName, PCSL_FILE_O_RDONLY, &handle) != 0)
+        return -1;
+    result = pcsl_file_sizeofopenfile(handle);
+    (void)pcsl_file_close(handle);
+    return result;
+}
+
+int pcsl_file_exist(const pcsl_string *fileName) {
+    void *handle = NULL;
+    if (pcsl_file_open(fileName, PCSL_FILE_O_RDONLY, &handle) != 0)
+        return 0;
+    (void)pcsl_file_close(handle);
+    return 1;
+}
+
+int pcsl_file_commitwrite(void *handle) {
+    return handle != NULL ? 0 : -1;
+}
+
+int pcsl_file_rename(const pcsl_string *oldName, const pcsl_string *newName) {
+    void *old_file = NULL;
+    void *new_file = NULL;
+    unsigned char buffer[1024];
+    int count;
+    int result = -1;
+    if (pcsl_file_open(oldName, PCSL_FILE_O_RDONLY, &old_file) != 0 ||
+        pcsl_file_open(newName, PCSL_FILE_O_WRONLY | PCSL_FILE_O_CREAT |
+            PCSL_FILE_O_TRUNC, &new_file) != 0)
+        goto done;
+    while ((count = pcsl_file_read(old_file, buffer, sizeof(buffer))) > 0)
+        if (pcsl_file_write(new_file, buffer, count) != count)
+            goto done;
+    if (count < 0)
+        goto done;
+    result = pcsl_file_unlink(oldName);
+done:
+    if (new_file != NULL) (void)pcsl_file_close(new_file);
+    if (old_file != NULL) (void)pcsl_file_close(old_file);
+    return result;
+}
+
+static int split_pattern(const char *pattern, char *root,
+    unsigned int capacity) {
+    const char *last = pattern;
+    const char *at;
+    unsigned int length;
+    for (at = pattern; *at != '\0'; ++at)
+        if (*at == '\\' || *at == '/') last = at + 1;
+    length = (unsigned int)(last - pattern);
+    if (length >= capacity)
+        return 0;
+    memcpy(root, pattern, length);
+    root[length] = '\0';
+    return 1;
+}
+
+void *pcsl_file_openfilelist(const pcsl_string *string) {
+    phoneme_pcsl_file_list_t *list;
+    char pattern[PHONEME_PCSL_PATH_CAPACITY];
+    const char *path = resolve_pcsl_path(string, pattern, sizeof(pattern));
+    int result;
+    if (path == NULL)
+        return NULL;
+    list = (phoneme_pcsl_file_list_t *)pcsl_mem_calloc(1u, sizeof(*list));
+    if (list == NULL || !split_pattern(path, list->root, sizeof(list->root))) {
+        if (list != NULL) pcsl_mem_free(list);
+        return NULL;
+    }
+    bda_fs_find_data_init(&list->find);
+    result = bda_fs_findfirst(path, PHONEME_FIND_ATTR_ALL, &list->find);
+    if (result == -1) {
+        pcsl_mem_free(list);
+        return NULL;
+    }
+    list->first_pending = 1;
+    list->open = 1;
+    return list;
+}
+
+int pcsl_file_closefilelist(void *handle) {
+    phoneme_pcsl_file_list_t *list = (phoneme_pcsl_file_list_t *)handle;
+    if (list == NULL)
+        return -1;
+    if (list->open) (void)bda_fs_findclose(&list->find);
+    pcsl_mem_free(list);
+    return 0;
+}
+
+static const char *leaf_name(const char *path) {
+    const char *leaf = path;
+    while (*path != '\0') {
+        if (*path == '\\' || *path == '/' || *path == ':') leaf = path + 1;
+        ++path;
+    }
+    return leaf;
+}
+
+int pcsl_file_getnextentry(void *handle, const pcsl_string *string,
+    pcsl_string *result) {
+    phoneme_pcsl_file_list_t *list = (phoneme_pcsl_file_list_t *)handle;
+    const char *leaf;
+    char full[PHONEME_PCSL_PATH_CAPACITY];
+    unsigned int root_length;
+    unsigned int leaf_length;
+    int next;
+    (void)string;
+    if (result == NULL)
+        return -1;
+    *result = PCSL_STRING_NULL;
+    if (list == NULL || !list->open)
+        return -1;
+    if (list->first_pending)
+        list->first_pending = 0;
+    else {
+        next = bda_fs_findnext(&list->find);
+        if (next == -1)
+            return -1;
+    }
+    list->find.name_or_path[sizeof(list->find.name_or_path) - 1u] = '\0';
+    leaf = leaf_name(list->find.name_or_path);
+    root_length = (unsigned int)strlen(list->root);
+    leaf_length = (unsigned int)strlen(leaf);
+    if (root_length + leaf_length >= sizeof(full))
+        return -1;
+    memcpy(full, list->root, root_length);
+    memcpy(full + root_length, leaf, leaf_length + 1u);
+    /* Runtime-created entries are ASCII, so UTF-8 conversion is exact. */
+    return pcsl_string_convert_from_utf8((const jbyte *)full,
+        (jsize)(root_length + leaf_length), result) == PCSL_STRING_OK ? 0 : -1;
+}
+
+jchar pcsl_file_getfileseparator(void) {
+    return (jchar)'\\';
+}
+
+jchar pcsl_file_getpathseparator(void) {
+    return (jchar)';';
+}
+
+long pcsl_file_getfreespace(void) {
+    return 4L * 1024L * 1024L;
+}
+
+long pcsl_file_getusedspace(const pcsl_string *systemDir) {
+    (void)systemDir;
+    return 0;
+}
+
+int pcsl_file_is_directory(const pcsl_string *path) {
+    char converted[PHONEME_PCSL_PATH_CAPACITY];
+    const char *name = resolve_pcsl_path(path, converted, sizeof(converted));
+    bda_fs_find_data_t find;
+    int result;
+    if (name == NULL)
+        return -1;
+    bda_fs_find_data_init(&find);
+    result = bda_fs_findfirst(name, PHONEME_FIND_ATTR_ALL, &find);
+    if (result == -1)
+        return 0;
+    (void)bda_fs_findclose(&find);
+    return 1;
+}
+
+int pcsl_file_mkdir(const pcsl_string *dirName) {
+    char converted[PHONEME_PCSL_PATH_CAPACITY];
+    const char *path = resolve_pcsl_path(dirName, converted, sizeof(converted));
+    int result;
+    if (path == NULL)
+        return -1;
+    result = bda_fs_mkdir(path);
+    return result == -1 ? (pcsl_file_is_directory(dirName) ? 0 : -1) : 0;
+}
+
+int pcsl_file_rmdir(const pcsl_string *dirName) {
+    char converted[PHONEME_PCSL_PATH_CAPACITY];
+    const char *path = resolve_pcsl_path(dirName, converted, sizeof(converted));
+    return path != NULL ? remove_bda_path(path) : -1;
+}
+
+jlong pcsl_file_getfreesize(const pcsl_string *path) {
+    (void)path;
+    return (jlong)(4L * 1024L * 1024L);
+}
+
+jlong pcsl_file_gettotalsize(const pcsl_string *path) {
+    (void)path;
+    return (jlong)(8L * 1024L * 1024L);
+}
+
+int pcsl_file_get_attribute(const pcsl_string *fileName, int type,
+    int *result) {
+    if (result == NULL || (!pcsl_file_exist(fileName) &&
+        !pcsl_file_is_directory(fileName)))
+        return -1;
+    if (type == PCSL_FILE_ATTR_READ || type == PCSL_FILE_ATTR_WRITE)
+        *result = 1;
+    else if (type == PCSL_FILE_ATTR_EXECUTE || type == PCSL_FILE_ATTR_HIDDEN)
+        *result = 0;
+    else
+        return -1;
+    return 0;
+}
+
+int pcsl_file_set_attribute(const pcsl_string *fileName, int type, int value) {
+    (void)fileName;
+    (void)value;
+    return type >= PCSL_FILE_ATTR_READ && type <= PCSL_FILE_ATTR_HIDDEN ? 0 : -1;
+}
+
+int pcsl_file_get_time(const pcsl_string *fileName, int type, long *result) {
+    (void)fileName;
+    if (result == NULL || type != PCSL_FILE_TIME_LAST_MODIFIED)
+        return -1;
+    *result = 0;
+    return 0;
+}

@@ -1,0 +1,191 @@
+#include <kni.h>
+
+#include <gxutl_graphics.h>
+
+#include "gxj_intern_font_bitmap.h"
+#include "gxj_intern_graphics.h"
+#include "gxj_intern_image.h"
+#include "gxj_putpixel.h"
+
+#define CJK_HEADER_SIZE 12u
+#define CJK_RECORD_SIZE 27u
+#define CJK_WIDTH 14
+#define CJK_HEIGHT 14
+#define CJK_GLYPH_BYTES 25u
+
+extern const unsigned char _binary_phoneme_cjk_font_bin_start[];
+extern const unsigned char _binary_phoneme_cjk_font_bin_end[];
+
+static unsigned int read_u16le(const unsigned char *data) {
+    return (unsigned int)data[0] | ((unsigned int)data[1] << 8);
+}
+
+static const unsigned char *cjk_glyph(jchar codepoint) {
+    const unsigned char *data = _binary_phoneme_cjk_font_bin_start;
+    const unsigned char *end = _binary_phoneme_cjk_font_bin_end;
+    unsigned int low;
+    unsigned int high;
+    if ((unsigned long)(end - data) < CJK_HEADER_SIZE ||
+            data[0] != 'C' || data[1] != 'J' ||
+            data[2] != '1' || data[3] != '4' ||
+            data[6] != CJK_WIDTH || data[7] != CJK_HEIGHT ||
+            data[8] != CJK_GLYPH_BYTES)
+        return NULL;
+    low = 0u;
+    high = read_u16le(data + 4u);
+    if (CJK_HEADER_SIZE + high * CJK_RECORD_SIZE >
+            (unsigned long)(end - data))
+        return NULL;
+    while (low < high) {
+        unsigned int middle = low + (high - low) / 2u;
+        const unsigned char *record = data + CJK_HEADER_SIZE +
+            middle * CJK_RECORD_SIZE;
+        unsigned int value = read_u16le(record);
+        if (value < (unsigned int)codepoint)
+            low = middle + 1u;
+        else
+            high = middle;
+    }
+    if (low < read_u16le(data + 4u)) {
+        const unsigned char *record = data + CJK_HEADER_SIZE +
+            low * CJK_RECORD_SIZE;
+        if (read_u16le(record) == (unsigned int)codepoint)
+            return record + 2u;
+    }
+    return NULL;
+}
+
+static pfontbitmap select_latin_bitmap(jchar codepoint) {
+    unsigned int index = 1u;
+    unsigned int high = ((unsigned int)codepoint >> 8) & 0xffu;
+    unsigned int low = (unsigned int)codepoint & 0xffu;
+    do {
+        if (high == FontBitmaps[index][FONT_CODE_RANGE_HIGH] &&
+                low >= FontBitmaps[index][FONT_CODE_FIRST_LOW] &&
+                low <= FontBitmaps[index][FONT_CODE_LAST_LOW])
+            return FontBitmaps[index];
+        ++index;
+    } while (index <= (unsigned int)FontBitmaps[0]);
+    return NULL;
+}
+
+static int latin_glyph_bit(jchar codepoint, int x, int y) {
+    pfontbitmap bitmap = select_latin_bitmap(codepoint);
+    unsigned long bit;
+    unsigned int first;
+    int width = FontBitmaps[1][FONT_WIDTH];
+    int height = FontBitmaps[1][FONT_HEIGHT];
+    if (bitmap == NULL) {
+        codepoint = (jchar)'?';
+        bitmap = FontBitmaps[1];
+    }
+    first = bitmap[FONT_CODE_FIRST_LOW];
+    bit = ((unsigned long)(((unsigned int)codepoint & 0xffu) - first) *
+        (unsigned long)width * (unsigned long)height) +
+        (unsigned long)y * (unsigned long)width + (unsigned long)x;
+    return (bitmap[FONT_DATA + (bit >> 3)] &
+        (unsigned char)(0x80u >> (bit & 7u))) != 0u;
+}
+
+static int cjk_glyph_bit(const unsigned char *glyph, int x, int y) {
+    unsigned int bit = (unsigned int)(y * CJK_WIDTH + x);
+    return (glyph[bit >> 3] & (unsigned char)(0x80u >> (bit & 7u))) != 0u;
+}
+
+static int glyph_width(jchar codepoint) {
+    return cjk_glyph(codepoint) != NULL ? CJK_WIDTH :
+        FontBitmaps[1][FONT_WIDTH];
+}
+
+int gx_get_charswidth(int face, int style, int size,
+        const jchar *char_array, int count) {
+    int width = 0;
+    int index;
+    (void)face;
+    (void)style;
+    (void)size;
+    if (char_array == NULL || count <= 0)
+        return 0;
+    for (index = 0; index < count; ++index)
+        width += glyph_width(char_array[index]);
+    return width;
+}
+
+void gx_get_fontinfo(int face, int style, int size,
+        int *ascent, int *descent, int *leading) {
+    (void)face;
+    (void)style;
+    (void)size;
+    *ascent = FontBitmaps[1][FONT_ASCENT];
+    *descent = FontBitmaps[1][FONT_DESCENT];
+    *leading = FontBitmaps[1][FONT_LEADING];
+}
+
+void gx_draw_chars(jint pixel, const jshort *clip,
+        const java_imagedata *destination, int dotted,
+        int face, int style, int size, int x, int y, int anchor,
+        const jchar *char_array, int count) {
+    gxj_screen_buffer temporary;
+    gxj_screen_buffer *buffer;
+    gxj_pixel_type color;
+    int total_width;
+    int cursor;
+    int index;
+    int clip_x1;
+    int clip_y1;
+    int clip_x2;
+    int clip_y2;
+    int font_height = FontBitmaps[1][FONT_HEIGHT];
+    int font_descent = FontBitmaps[1][FONT_DESCENT];
+    (void)dotted;
+    (void)face;
+    (void)style;
+    (void)size;
+    if (clip == NULL || char_array == NULL || count <= 0)
+        return;
+    buffer = gxj_get_image_screen_buffer_impl(destination, &temporary, NULL);
+    buffer = (gxj_screen_buffer *)getScreenBuffer(buffer);
+    if (buffer == NULL || buffer->pixelData == NULL)
+        return;
+    total_width = gx_get_charswidth(face, style, size, char_array, count);
+    if ((anchor & RIGHT) != 0)
+        x -= total_width;
+    else if ((anchor & HCENTER) != 0)
+        x -= total_width / 2;
+    if ((anchor & BOTTOM) != 0)
+        y -= font_height;
+    else if ((anchor & BASELINE) != 0)
+        y -= font_height - font_descent;
+    clip_x1 = clip[0] < 0 ? 0 : clip[0];
+    clip_y1 = clip[1] < 0 ? 0 : clip[1];
+    clip_x2 = clip[2] > buffer->width ? buffer->width : clip[2];
+    clip_y2 = clip[3] > buffer->height ? buffer->height : clip[3];
+    if (clip_x1 >= clip_x2 || clip_y1 >= clip_y2)
+        return;
+    color = GXJ_RGB24TORGB16(pixel);
+    cursor = x;
+    for (index = 0; index < count; ++index) {
+        const unsigned char *cjk = cjk_glyph(char_array[index]);
+        int width = cjk != NULL ? CJK_WIDTH : FontBitmaps[1][FONT_WIDTH];
+        int glyph_height = cjk != NULL ? CJK_HEIGHT : font_height;
+        int gy;
+        for (gy = 0; gy < glyph_height; ++gy) {
+            int destination_y = y + gy;
+            int gx;
+            if (destination_y < clip_y1 || destination_y >= clip_y2)
+                continue;
+            for (gx = 0; gx < width; ++gx) {
+                int destination_x = cursor + gx;
+                int ink;
+                if (destination_x < clip_x1 || destination_x >= clip_x2)
+                    continue;
+                ink = cjk != NULL ? cjk_glyph_bit(cjk, gx, gy) :
+                    latin_glyph_bit(char_array[index], gx, gy);
+                if (ink)
+                    buffer->pixelData[destination_y * buffer->width +
+                        destination_x] = color;
+            }
+        }
+        cursor += width;
+    }
+}

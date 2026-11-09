@@ -1,0 +1,1251 @@
+#include <string.h>
+
+#include "bda_sdk.h"
+#include "gxj_putpixel.h"
+#include "gxj_screen_buffer.h"
+#include "midpMalloc.h"
+#include "platform/bbk9588/phoneme_audio.h"
+#include "platform/bbk9588/phoneme_bbk9588_port.h"
+
+#define PHONEME_INPUT_ARM_MS 350u
+#define PHONEME_RAW_EVENT_DRAIN_LIMIT 4u
+#define PHONEME_KEY_UP_MASK (1u << 0)
+#define PHONEME_KEY_DOWN_MASK (1u << 1)
+#define PHONEME_KEY_LEFT_MASK (1u << 2)
+#define PHONEME_KEY_RIGHT_MASK (1u << 3)
+#define PHONEME_KEY_ESCAPE_MASK (1u << 4)
+#define PHONEME_KEY_ENTER_MASK (1u << 5)
+#define SOFTPAD_FLOAT_RADIUS 15
+#define SOFTPAD_FLOAT_HIT_RADIUS 22
+#define SOFTPAD_DRAG_THRESHOLD_SQUARED 144
+#define SOFTPAD_PANEL_X 33
+#define SOFTPAD_PANEL_WIDTH 174
+#define SOFTPAD_PANEL_HEIGHT 232
+#define SOFTPAD_INNER_X 42
+#define SOFTPAD_ACTION_Y 8
+#define SOFTPAD_ACTION_WIDTH 36
+#define SOFTPAD_ACTION_HEIGHT 28
+#define SOFTPAD_ACTION_GAP_X 4
+#define SOFTPAD_VOLUME_BAR_Y 38
+#define SOFTPAD_VOLUME_BAR_HEIGHT 3
+#define SOFTPAD_LR_Y 44
+#define SOFTPAD_LR_HEIGHT 30
+#define SOFTPAD_NUMERIC_Y 80
+#define SOFTPAD_KEY_WIDTH 48
+#define SOFTPAD_KEY_HEIGHT 32
+#define SOFTPAD_KEY_GAP_X 6
+#define SOFTPAD_KEY_GAP_Y 5
+#define SOFTPAD_DIRTY_RECT_LIMIT 6
+
+#define SOFTPAD_ACTION_EXIT (-1001)
+#define SOFTPAD_ACTION_VOLUME_DOWN (-1002)
+#define SOFTPAD_ACTION_MUTE (-1003)
+#define SOFTPAD_ACTION_VOLUME_UP (-1004)
+
+enum {
+    SOFTPAD_TOUCH_NONE = 0,
+    SOFTPAD_TOUCH_GAME = 1,
+    SOFTPAD_TOUCH_FLOAT = 2,
+    SOFTPAD_TOUCH_KEY = 3,
+    SOFTPAD_TOUCH_PANEL = 4,
+    SOFTPAD_TOUCH_ACTION = 5
+};
+
+gxj_screen_buffer gxj_system_screen_buffer;
+
+typedef struct softpad_dirty_rect {
+    int left;
+    int top;
+    int right;
+    int bottom;
+} softpad_dirty_rect_t;
+
+static bda_handle_t g_frame;
+static bda_gui_framebuffer_t g_framebuffer;
+static j2me_native_event_queue_t g_events;
+static bda_gui_input_packet_t g_last_packet;
+static int g_initialized;
+static int g_detached;
+static int g_touch_down;
+static u16 g_touch_x;
+static u16 g_touch_y;
+static u32 g_input_arm_at;
+static u32 g_input_sample_tick;
+static u32 g_present_count;
+static u32 g_close_pump_count;
+static int g_last_screen_rotated;
+static int g_softpad_visible;
+static int g_softpad_float_x;
+static int g_softpad_float_y;
+static int g_softpad_touch_mode;
+static int g_softpad_drag_start_x;
+static int g_softpad_drag_start_y;
+static int g_softpad_drag_offset_x;
+static int g_softpad_drag_offset_y;
+static int g_softpad_dragged;
+static int g_softpad_active_key;
+static int g_softpad_active_action;
+static int g_softpad_exit_requested;
+static int g_softpad_drawn_float_x;
+static int g_softpad_drawn_float_y;
+static int g_softpad_drawn_visible;
+static int g_softpad_drawn_panel_y;
+static int g_softpad_dirty_float;
+static int g_softpad_dirty_panel;
+static softpad_dirty_rect_t
+    g_softpad_dirty_rects[SOFTPAD_DIRTY_RECT_LIMIT];
+static int g_softpad_dirty_rect_count;
+static u32 g_softpad_toggle_count;
+static u32 g_softpad_key_event_count;
+static u32 g_softpad_drag_count;
+static u32 g_softpad_exit_count;
+static u32 g_softpad_volume_action_count;
+static u32 g_softpad_release_fallback_count;
+static u32 g_raw_event_fetch_count;
+static u32 g_raw_touch_event_count;
+static u32 g_raw_touch_move_count;
+static char g_selected_jar[301];
+static char g_resolved_path[512];
+
+static char k_midp_home_gbk[] =
+    "A:\\" "\xd3\xa6\xd3\xc3" "\\" "\xca\xfd\xbe\xdd" "\\J2ME";
+
+static const char k_softpad_labels[] = "0123456789*#LRX-M+";
+static const u8 k_softpad_glyphs[][7] = {
+    {14, 17, 19, 21, 25, 17, 14}, /* 0 */
+    {4, 12, 4, 4, 4, 4, 14},     /* 1 */
+    {14, 17, 1, 2, 4, 8, 31},    /* 2 */
+    {30, 1, 1, 14, 1, 1, 30},    /* 3 */
+    {2, 6, 10, 18, 31, 2, 2},    /* 4 */
+    {31, 16, 16, 30, 1, 1, 30},  /* 5 */
+    {14, 16, 16, 30, 17, 17, 14},/* 6 */
+    {31, 1, 2, 4, 8, 8, 8},      /* 7 */
+    {14, 17, 17, 14, 17, 17, 14},/* 8 */
+    {14, 17, 17, 15, 1, 1, 14},  /* 9 */
+    {0, 21, 14, 31, 14, 21, 0},  /* * */
+    {10, 31, 10, 10, 31, 10, 0}, /* # */
+    {16, 16, 16, 16, 16, 16, 31},/* L */
+    {30, 17, 17, 30, 20, 18, 17},/* R */
+    {17, 17, 10, 4, 10, 17, 17}, /* X */
+    {0, 0, 0, 31, 0, 0, 0},      /* - */
+    {17, 27, 21, 21, 17, 17, 17},/* M */
+    {0, 4, 4, 31, 4, 4, 0}       /* + */
+};
+
+static u32 phoneme_time_ms(void) {
+    return bda_gui_tick_count_25ms() * 25u;
+}
+
+static int softpad_panel_y_for(int float_y) {
+    return float_y < J2ME_PHONEME_SCREEN_HEIGHT / 2 ?
+        J2ME_PHONEME_SCREEN_HEIGHT - SOFTPAD_PANEL_HEIGHT - 8 : 8;
+}
+
+static int softpad_panel_y(void) {
+    return softpad_panel_y_for(g_softpad_float_y);
+}
+
+static int softpad_inside(int x, int y, int left, int top,
+    int width, int height) {
+    return x >= left && y >= top && x < left + width && y < top + height;
+}
+
+static int softpad_inside_float(int x, int y) {
+    int dx = x - g_softpad_float_x;
+    int dy = y - g_softpad_float_y;
+    return dx * dx + dy * dy <=
+        SOFTPAD_FLOAT_HIT_RADIUS * SOFTPAD_FLOAT_HIT_RADIUS;
+}
+
+static int softpad_inside_panel(int x, int y) {
+    return g_softpad_visible && softpad_inside(x, y, SOFTPAD_PANEL_X,
+        softpad_panel_y(), SOFTPAD_PANEL_WIDTH, SOFTPAD_PANEL_HEIGHT);
+}
+
+static int softpad_covers_pixel(int x, int y) {
+    int dx = x - g_softpad_float_x;
+    int dy = y - g_softpad_float_y;
+    if (dx * dx + dy * dy <=
+            SOFTPAD_FLOAT_RADIUS * SOFTPAD_FLOAT_RADIUS)
+        return 1;
+    return softpad_inside_panel(x, y);
+}
+
+static int softpad_key_at(int x, int y) {
+    static const int numeric_keys[12] = {
+        '1', '2', '3', '4', '5', '6',
+        '7', '8', '9', '*', '0', '#'
+    };
+    int panel_y = softpad_panel_y();
+    int row;
+    int column;
+    int key_x;
+    int key_y;
+    if (!g_softpad_visible)
+        return 0;
+    for (column = 0; column < 4; ++column) {
+        static const int actions[4] = {
+            SOFTPAD_ACTION_EXIT, SOFTPAD_ACTION_VOLUME_DOWN,
+            SOFTPAD_ACTION_MUTE, SOFTPAD_ACTION_VOLUME_UP
+        };
+        key_x = SOFTPAD_INNER_X +
+            column * (SOFTPAD_ACTION_WIDTH + SOFTPAD_ACTION_GAP_X);
+        if (softpad_inside(x, y, key_x, panel_y + SOFTPAD_ACTION_Y,
+                SOFTPAD_ACTION_WIDTH, SOFTPAD_ACTION_HEIGHT))
+            return actions[column];
+    }
+    if (softpad_inside(x, y, SOFTPAD_INNER_X,
+            panel_y + SOFTPAD_LR_Y, 75, SOFTPAD_LR_HEIGHT))
+        return -6;
+    if (softpad_inside(x, y, SOFTPAD_INNER_X + 81,
+            panel_y + SOFTPAD_LR_Y, 75, SOFTPAD_LR_HEIGHT))
+        return -7;
+    key_y = panel_y + SOFTPAD_NUMERIC_Y;
+    if (y < key_y)
+        return 0;
+    row = (y - key_y) / (SOFTPAD_KEY_HEIGHT + SOFTPAD_KEY_GAP_Y);
+    column = (x - SOFTPAD_INNER_X) /
+        (SOFTPAD_KEY_WIDTH + SOFTPAD_KEY_GAP_X);
+    if (row < 0 || row >= 4 || column < 0 || column >= 3)
+        return 0;
+    key_x = SOFTPAD_INNER_X +
+        column * (SOFTPAD_KEY_WIDTH + SOFTPAD_KEY_GAP_X);
+    key_y += row * (SOFTPAD_KEY_HEIGHT + SOFTPAD_KEY_GAP_Y);
+    if (!softpad_inside(x, y, key_x, key_y,
+            SOFTPAD_KEY_WIDTH, SOFTPAD_KEY_HEIGHT))
+        return 0;
+    return numeric_keys[row * 3 + column];
+}
+
+static u16 softpad_blend(u16 base, u16 overlay, u32 alpha) {
+    u32 inverse = 256u - alpha;
+    u32 red = ((((u32)base >> 11) & 31u) * inverse +
+        (((u32)overlay >> 11) & 31u) * alpha) >> 8;
+    u32 green = ((((u32)base >> 5) & 63u) * inverse +
+        (((u32)overlay >> 5) & 63u) * alpha) >> 8;
+    u32 blue = (((u32)base & 31u) * inverse +
+        ((u32)overlay & 31u) * alpha) >> 8;
+    return (u16)((red << 11) | (green << 5) | blue);
+}
+
+static int softpad_source_pixel(int x, int y, u16 *pixel) {
+    gxj_pixel_type *source = gxj_system_screen_buffer.pixelData;
+    int width = gxj_system_screen_buffer.width;
+    int height = gxj_system_screen_buffer.height;
+    int source_x = x;
+    int source_y = y;
+    if (source == NULL || pixel == NULL)
+        return 0;
+    if (g_last_screen_rotated) {
+        source_x = y;
+        source_y = height - 1 - x;
+    }
+    if (source_x < 0 || source_y < 0 ||
+            source_x >= width || source_y >= height)
+        return 0;
+    *pixel = (u16)source[source_y * width + source_x];
+    return 1;
+}
+
+static void softpad_write_screen_pixel(int x, int y, u16 pixel) {
+    int destination_x = x;
+    int destination_y = y;
+    if (g_framebuffer.pixels == NULL || x < 0 || y < 0 ||
+            x >= J2ME_PHONEME_SCREEN_WIDTH ||
+            y >= J2ME_PHONEME_SCREEN_HEIGHT)
+        return;
+    if (g_framebuffer.rotate_180) {
+        destination_x = J2ME_PHONEME_SCREEN_WIDTH - 1 - destination_x;
+        destination_y = J2ME_PHONEME_SCREEN_HEIGHT - 1 - destination_y;
+    }
+    g_framebuffer.pixels[destination_y * J2ME_PHONEME_SCREEN_WIDTH +
+        destination_x] = pixel;
+}
+
+static const u8 *softpad_glyph(char label) {
+    unsigned int index;
+    for (index = 0u; index < sizeof(k_softpad_labels) - 1u; ++index)
+        if (k_softpad_labels[index] == label)
+            return k_softpad_glyphs[index];
+    return NULL;
+}
+
+static int softpad_label_pixel(int x, int y, int center_x, int center_y,
+    char label) {
+    const u8 *rows = softpad_glyph(label);
+    int glyph_x = x - (center_x - 5);
+    int glyph_y = y - (center_y - 7);
+    if (rows == NULL)
+        return 0;
+    if (glyph_x < 0 || glyph_x >= 10 || glyph_y < 0 || glyph_y >= 14)
+        return 0;
+    return (rows[glyph_y / 2] & (1u << (4 - glyph_x / 2))) != 0u;
+}
+
+static int softpad_button_at_pixel(int x, int y, int *button_x,
+    int *button_y, int *button_width, int *button_height, int *key,
+    char *label) {
+    static const char numeric_labels[12] = {
+        '1', '2', '3', '4', '5', '6',
+        '7', '8', '9', '*', '0', '#'
+    };
+    int panel_y = softpad_panel_y();
+    int relative_x;
+    int relative_y;
+    int row;
+    int column;
+    int index;
+    static const int actions[4] = {
+        SOFTPAD_ACTION_EXIT, SOFTPAD_ACTION_VOLUME_DOWN,
+        SOFTPAD_ACTION_MUTE, SOFTPAD_ACTION_VOLUME_UP
+    };
+    static const char action_labels[4] = { 'X', '-', 'M', '+' };
+    for (column = 0; column < 4; ++column) {
+        *button_x = SOFTPAD_INNER_X +
+            column * (SOFTPAD_ACTION_WIDTH + SOFTPAD_ACTION_GAP_X);
+        *button_y = panel_y + SOFTPAD_ACTION_Y;
+        if (softpad_inside(x, y, *button_x, *button_y,
+                SOFTPAD_ACTION_WIDTH, SOFTPAD_ACTION_HEIGHT)) {
+            *button_width = SOFTPAD_ACTION_WIDTH;
+            *button_height = SOFTPAD_ACTION_HEIGHT;
+            *key = actions[column];
+            *label = action_labels[column];
+            return 1;
+        }
+    }
+    if (softpad_inside(x, y, SOFTPAD_INNER_X,
+            panel_y + SOFTPAD_LR_Y, 75, SOFTPAD_LR_HEIGHT)) {
+        *button_x = SOFTPAD_INNER_X;
+        *button_y = panel_y + SOFTPAD_LR_Y;
+        *button_width = 75;
+        *button_height = SOFTPAD_LR_HEIGHT;
+        *key = -6;
+        *label = 'L';
+        return 1;
+    }
+    if (softpad_inside(x, y, SOFTPAD_INNER_X + 81,
+            panel_y + SOFTPAD_LR_Y, 75, SOFTPAD_LR_HEIGHT)) {
+        *button_x = SOFTPAD_INNER_X + 81;
+        *button_y = panel_y + SOFTPAD_LR_Y;
+        *button_width = 75;
+        *button_height = SOFTPAD_LR_HEIGHT;
+        *key = -7;
+        *label = 'R';
+        return 1;
+    }
+    relative_x = x - SOFTPAD_INNER_X;
+    relative_y = y - (panel_y + SOFTPAD_NUMERIC_Y);
+    if (relative_x < 0 || relative_y < 0)
+        return 0;
+    column = relative_x / (SOFTPAD_KEY_WIDTH + SOFTPAD_KEY_GAP_X);
+    row = relative_y / (SOFTPAD_KEY_HEIGHT + SOFTPAD_KEY_GAP_Y);
+    if (column < 0 || column >= 3 || row < 0 || row >= 4)
+        return 0;
+    *button_x = SOFTPAD_INNER_X +
+        column * (SOFTPAD_KEY_WIDTH + SOFTPAD_KEY_GAP_X);
+    *button_y = panel_y + SOFTPAD_NUMERIC_Y +
+        row * (SOFTPAD_KEY_HEIGHT + SOFTPAD_KEY_GAP_Y);
+    *button_width = SOFTPAD_KEY_WIDTH;
+    *button_height = SOFTPAD_KEY_HEIGHT;
+    if (!softpad_inside(x, y, *button_x, *button_y,
+            *button_width, *button_height))
+        return 0;
+    index = row * 3 + column;
+    *key = numeric_labels[index];
+    *label = numeric_labels[index];
+    return 1;
+}
+
+static int softpad_control_rect(int control, int *left, int *top,
+        int *width, int *height) {
+    static const int numeric_keys[12] = {
+        '1', '2', '3', '4', '5', '6',
+        '7', '8', '9', '*', '0', '#'
+    };
+    int panel_y = softpad_panel_y();
+    int index;
+    if (control <= SOFTPAD_ACTION_EXIT &&
+            control >= SOFTPAD_ACTION_VOLUME_UP) {
+        index = SOFTPAD_ACTION_EXIT - control;
+        *left = SOFTPAD_INNER_X +
+            index * (SOFTPAD_ACTION_WIDTH + SOFTPAD_ACTION_GAP_X);
+        *top = panel_y + SOFTPAD_ACTION_Y;
+        *width = SOFTPAD_ACTION_WIDTH;
+        *height = SOFTPAD_ACTION_HEIGHT;
+        return 1;
+    }
+    if (control == -6 || control == -7) {
+        *left = SOFTPAD_INNER_X + (control == -7 ? 81 : 0);
+        *top = panel_y + SOFTPAD_LR_Y;
+        *width = 75;
+        *height = SOFTPAD_LR_HEIGHT;
+        return 1;
+    }
+    for (index = 0; index < 12; ++index) {
+        if (control == numeric_keys[index]) {
+            *left = SOFTPAD_INNER_X + (index % 3) *
+                (SOFTPAD_KEY_WIDTH + SOFTPAD_KEY_GAP_X);
+            *top = panel_y + SOFTPAD_NUMERIC_Y + (index / 3) *
+                (SOFTPAD_KEY_HEIGHT + SOFTPAD_KEY_GAP_Y);
+            *width = SOFTPAD_KEY_WIDTH;
+            *height = SOFTPAD_KEY_HEIGHT;
+            return 1;
+        }
+    }
+    return 0;
+}
+
+static u16 softpad_composite_pixel(int x, int y, u16 base) {
+    int panel_y = softpad_panel_y();
+    int button_x;
+    int button_y;
+    int button_width;
+    int button_height;
+    int key;
+    char label;
+    int dx;
+    int dy;
+    int distance;
+    u16 result = base;
+    if (g_softpad_visible && softpad_inside(x, y, SOFTPAD_PANEL_X,
+            panel_y, SOFTPAD_PANEL_WIDTH, SOFTPAD_PANEL_HEIGHT)) {
+        result = softpad_blend(base, 0x0000u, 224u);
+        if (softpad_inside(x, y, SOFTPAD_INNER_X,
+                panel_y + SOFTPAD_VOLUME_BAR_Y,
+                SOFTPAD_ACTION_WIDTH * 4 + SOFTPAD_ACTION_GAP_X * 3,
+                SOFTPAD_VOLUME_BAR_HEIGHT)) {
+            int relative_x = x - SOFTPAD_INNER_X;
+            int level_width = (int)(j2me_phoneme_audio_master_volume() *
+                (SOFTPAD_ACTION_WIDTH * 4 + SOFTPAD_ACTION_GAP_X * 3) /
+                100u);
+            u16 bar_color = relative_x < level_width &&
+                !j2me_phoneme_audio_master_muted() ? 0x07e0u : 0x4208u;
+            result = softpad_blend(base, bar_color, 232u);
+        }
+        if (softpad_button_at_pixel(x, y, &button_x, &button_y,
+                &button_width, &button_height, &key, &label)) {
+            int active = key == g_softpad_active_key ||
+                key == g_softpad_active_action;
+            u16 color = active ? 0xfd20u :
+                (key == SOFTPAD_ACTION_MUTE &&
+                 j2me_phoneme_audio_master_muted() ? 0xb800u : 0x0000u);
+            u32 alpha = active ? 224u : 208u;
+            result = softpad_blend(base, color, alpha);
+            if (x == button_x || y == button_y ||
+                    x == button_x + button_width - 1 ||
+                    y == button_y + button_height - 1)
+                result = softpad_blend(base, 0xffffu, 224u);
+            if (softpad_label_pixel(x, y,
+                    button_x + button_width / 2,
+                    button_y + button_height / 2, label))
+                result = 0xffffu;
+        }
+    }
+    dx = x - g_softpad_float_x;
+    dy = y - g_softpad_float_y;
+    distance = dx * dx + dy * dy;
+    if (distance <= SOFTPAD_FLOAT_RADIUS * SOFTPAD_FLOAT_RADIUS) {
+        int inner_radius = SOFTPAD_FLOAT_RADIUS - 3;
+        u16 color = distance > inner_radius * inner_radius ?
+            0xffffu : 0x4208u;
+        u32 alpha = distance > inner_radius * inner_radius ? 240u : 216u;
+        result = softpad_blend(base, color, alpha);
+        if (dy >= -1 && dy <= 1 &&
+                ((dx >= -6 && dx <= -4) ||
+                 (dx >= -1 && dx <= 1) ||
+                 (dx >= 4 && dx <= 6)))
+            result = 0xffffu;
+    }
+    return result;
+}
+
+static void softpad_refresh_rect(int left, int top, int width, int height) {
+    int x;
+    int y;
+    u16 pixel;
+    int right = left + width;
+    int bottom = top + height;
+    if (left < 0) left = 0;
+    if (top < 0) top = 0;
+    if (right > J2ME_PHONEME_SCREEN_WIDTH)
+        right = J2ME_PHONEME_SCREEN_WIDTH;
+    if (bottom > J2ME_PHONEME_SCREEN_HEIGHT)
+        bottom = J2ME_PHONEME_SCREEN_HEIGHT;
+    for (y = top; y < bottom; ++y) {
+        for (x = left; x < right; ++x)
+            if (softpad_source_pixel(x, y, &pixel)) {
+                if (softpad_covers_pixel(x, y))
+                    pixel = softpad_composite_pixel(x, y, pixel);
+                softpad_write_screen_pixel(x, y, pixel);
+            }
+        /* A full translucent panel is relatively expensive on the 9588.
+         * Refill PCM between small row groups so its 23 ms hardware queue
+         * never waits for the overlay renderer to finish all 232 rows. */
+        if (right - left >= 96 && ((y - top) & 7) == 7)
+            j2me_phoneme_audio_pump();
+    }
+}
+
+static void softpad_request_rect(int left, int top, int width, int height) {
+    int index;
+    int right = left + width;
+    int bottom = top + height;
+    softpad_dirty_rect_t *rect;
+    if (width <= 0 || height <= 0)
+        return;
+    for (index = 0; index < g_softpad_dirty_rect_count; ++index) {
+        rect = &g_softpad_dirty_rects[index];
+        if (right < rect->left || left > rect->right ||
+                bottom < rect->top || top > rect->bottom)
+            continue;
+        if (left < rect->left)
+            rect->left = left;
+        if (top < rect->top)
+            rect->top = top;
+        if (right > rect->right)
+            rect->right = right;
+        if (bottom > rect->bottom)
+            rect->bottom = bottom;
+        return;
+    }
+    if (g_softpad_dirty_rect_count < SOFTPAD_DIRTY_RECT_LIMIT) {
+        rect = &g_softpad_dirty_rects[g_softpad_dirty_rect_count++];
+        rect->left = left;
+        rect->top = top;
+        rect->right = right;
+        rect->bottom = bottom;
+        return;
+    }
+    /* This is only a safety fallback for an unusually busy input sample.
+     * Normal presses use at most three independent rectangles. */
+    rect = &g_softpad_dirty_rects[SOFTPAD_DIRTY_RECT_LIMIT - 1];
+    if (left < rect->left)
+        rect->left = left;
+    if (top < rect->top)
+        rect->top = top;
+    if (right > rect->right)
+        rect->right = right;
+    if (bottom > rect->bottom)
+        rect->bottom = bottom;
+}
+
+static void softpad_request_control(int control) {
+    int left;
+    int top;
+    int width;
+    int height;
+    if (softpad_control_rect(control, &left, &top, &width, &height))
+        softpad_request_rect(left, top, width, height);
+}
+
+static void softpad_refresh_dirty(void) {
+    int diameter = SOFTPAD_FLOAT_RADIUS * 2 + 1;
+    int index;
+    if (!g_initialized || g_framebuffer.pixels == NULL)
+        return;
+    if (g_softpad_dirty_float) {
+        softpad_refresh_rect(g_softpad_drawn_float_x - SOFTPAD_FLOAT_RADIUS,
+            g_softpad_drawn_float_y - SOFTPAD_FLOAT_RADIUS,
+            diameter, diameter);
+        softpad_refresh_rect(g_softpad_float_x - SOFTPAD_FLOAT_RADIUS,
+            g_softpad_float_y - SOFTPAD_FLOAT_RADIUS, diameter, diameter);
+    }
+    if (g_softpad_dirty_panel) {
+        if (g_softpad_drawn_visible)
+            softpad_refresh_rect(SOFTPAD_PANEL_X,
+                g_softpad_drawn_panel_y, SOFTPAD_PANEL_WIDTH,
+                SOFTPAD_PANEL_HEIGHT);
+        if (g_softpad_visible)
+            softpad_refresh_rect(SOFTPAD_PANEL_X, softpad_panel_y(),
+                SOFTPAD_PANEL_WIDTH, SOFTPAD_PANEL_HEIGHT);
+    } else if (g_softpad_visible) {
+        for (index = 0; index < g_softpad_dirty_rect_count; ++index) {
+            softpad_dirty_rect_t *rect = &g_softpad_dirty_rects[index];
+            softpad_refresh_rect(rect->left, rect->top,
+                rect->right - rect->left, rect->bottom - rect->top);
+        }
+    }
+#if defined(__mips__)
+    __asm__ volatile("sync" ::: "memory");
+#endif
+    g_softpad_drawn_float_x = g_softpad_float_x;
+    g_softpad_drawn_float_y = g_softpad_float_y;
+    g_softpad_drawn_visible = g_softpad_visible;
+    g_softpad_drawn_panel_y = softpad_panel_y();
+    g_softpad_dirty_float = 0;
+    g_softpad_dirty_panel = 0;
+    g_softpad_dirty_rect_count = 0;
+}
+
+static void softpad_request_dirty(int dirty_float, int dirty_panel) {
+    if (dirty_float)
+        g_softpad_dirty_float = 1;
+    if (dirty_panel)
+        g_softpad_dirty_panel = 1;
+}
+
+static int softpad_clamp(int value, int minimum, int maximum) {
+    if (value < minimum)
+        return minimum;
+    if (value > maximum)
+        return maximum;
+    return value;
+}
+
+static void softpad_release_key(u32 now) {
+    if (g_softpad_active_key != 0) {
+        softpad_request_control(g_softpad_active_key);
+        j2me_native_event_push_key(&g_events, J2ME_NATIVE_EVENT_KEY_UP,
+            g_softpad_active_key, now);
+        ++g_softpad_key_event_count;
+        g_softpad_active_key = 0;
+    }
+}
+
+static void softpad_press_key(int key, u32 now) {
+    if (key == g_softpad_active_key)
+        return;
+    softpad_release_key(now);
+    if (key != 0) {
+        g_softpad_active_key = key;
+        softpad_request_control(key);
+        j2me_native_event_push_key(&g_events, J2ME_NATIVE_EVENT_KEY_DOWN,
+            key, now);
+        ++g_softpad_key_event_count;
+    }
+}
+
+static int softpad_is_action(int control) {
+    return control <= SOFTPAD_ACTION_EXIT &&
+        control >= SOFTPAD_ACTION_VOLUME_UP;
+}
+
+static void softpad_set_active_action(int action) {
+    if (!softpad_is_action(action))
+        action = 0;
+    if (action != g_softpad_active_action) {
+        softpad_request_control(g_softpad_active_action);
+        g_softpad_active_action = action;
+        softpad_request_control(g_softpad_active_action);
+    }
+}
+
+static void softpad_activate_action(int action) {
+    if (action == SOFTPAD_ACTION_EXIT) {
+        if (bda_confirm("J2ME", "Exit game?") == BDA_DIALOG_RESULT_YES) {
+            if (!g_softpad_exit_requested) {
+                g_softpad_exit_requested = 1;
+                ++g_softpad_exit_count;
+            }
+        } else {
+            /* The firmware modal temporarily owns the physical display.
+             * Recompose our small overlay when it hands the frame back. */
+            softpad_request_dirty(1, 1);
+        }
+    } else if (action == SOFTPAD_ACTION_VOLUME_DOWN) {
+        j2me_phoneme_audio_adjust_master_volume(-10);
+        ++g_softpad_volume_action_count;
+    } else if (action == SOFTPAD_ACTION_MUTE) {
+        j2me_phoneme_audio_toggle_master_mute();
+        ++g_softpad_volume_action_count;
+    } else if (action == SOFTPAD_ACTION_VOLUME_UP) {
+        j2me_phoneme_audio_adjust_master_volume(10);
+        ++g_softpad_volume_action_count;
+    }
+    if (action == SOFTPAD_ACTION_VOLUME_DOWN ||
+            action == SOFTPAD_ACTION_MUTE ||
+            action == SOFTPAD_ACTION_VOLUME_UP)
+        softpad_request_rect(SOFTPAD_INNER_X,
+            softpad_panel_y() + SOFTPAD_VOLUME_BAR_Y,
+            SOFTPAD_ACTION_WIDTH * 4 + SOFTPAD_ACTION_GAP_X * 3,
+            SOFTPAD_VOLUME_BAR_HEIGHT);
+}
+
+static int softpad_handle_touch(int is_release, int x, int y, u32 now) {
+    if (!is_release && !g_touch_down) {
+        if (softpad_inside_float(x, y)) {
+            g_touch_down = 1;
+            g_softpad_touch_mode = SOFTPAD_TOUCH_FLOAT;
+            g_softpad_drag_start_x = x;
+            g_softpad_drag_start_y = y;
+            g_softpad_drag_offset_x = x - g_softpad_float_x;
+            g_softpad_drag_offset_y = y - g_softpad_float_y;
+            g_softpad_dragged = 0;
+            return 1;
+        }
+        if (g_softpad_visible) {
+            int control = softpad_key_at(x, y);
+            if (softpad_is_action(control)) {
+                g_touch_down = 1;
+                g_softpad_touch_mode = SOFTPAD_TOUCH_ACTION;
+                softpad_set_active_action(control);
+                return 1;
+            }
+            if (control != 0) {
+                g_touch_down = 1;
+                g_softpad_touch_mode = SOFTPAD_TOUCH_KEY;
+                softpad_press_key(control, now);
+                return 1;
+            }
+            if (softpad_inside(x, y, SOFTPAD_PANEL_X,
+                    softpad_panel_y(), SOFTPAD_PANEL_WIDTH,
+                    SOFTPAD_PANEL_HEIGHT)) {
+                g_touch_down = 1;
+                g_softpad_touch_mode = SOFTPAD_TOUCH_PANEL;
+                return 1;
+            }
+        }
+        g_softpad_touch_mode = SOFTPAD_TOUCH_GAME;
+        return 0;
+    }
+    if (!is_release) {
+        if (g_softpad_touch_mode == SOFTPAD_TOUCH_FLOAT) {
+            int next_x = softpad_clamp(x - g_softpad_drag_offset_x,
+                SOFTPAD_FLOAT_RADIUS + 2,
+                J2ME_PHONEME_SCREEN_WIDTH - SOFTPAD_FLOAT_RADIUS - 2);
+            int next_y = softpad_clamp(y - g_softpad_drag_offset_y,
+                SOFTPAD_FLOAT_RADIUS + 2,
+                J2ME_PHONEME_SCREEN_HEIGHT - SOFTPAD_FLOAT_RADIUS - 2);
+            int delta_x = x - g_softpad_drag_start_x;
+            int delta_y = y - g_softpad_drag_start_y;
+            if (!g_softpad_dragged &&
+                    delta_x * delta_x + delta_y * delta_y >
+                        SOFTPAD_DRAG_THRESHOLD_SQUARED)
+                g_softpad_dragged = 1;
+            /* Do not move the dot inside the tap dead zone.  Real resistive
+             * panels jitter several pixels even when the finger is still;
+             * moving immediately turned a short tap into a drag. */
+            if (!g_softpad_dragged)
+                return 1;
+            if (next_x != g_softpad_float_x || next_y != g_softpad_float_y) {
+                int old_panel_y = softpad_panel_y();
+                g_softpad_float_x = next_x;
+                g_softpad_float_y = next_y;
+                softpad_request_dirty(1, g_softpad_visible &&
+                    old_panel_y != softpad_panel_y());
+            }
+            return 1;
+        }
+        if (g_softpad_touch_mode == SOFTPAD_TOUCH_KEY) {
+            int control = softpad_key_at(x, y);
+            softpad_press_key(softpad_is_action(control) ? 0 : control, now);
+            return 1;
+        }
+        if (g_softpad_touch_mode == SOFTPAD_TOUCH_ACTION) {
+            softpad_set_active_action(softpad_key_at(x, y));
+            return 1;
+        }
+        return g_softpad_touch_mode == SOFTPAD_TOUCH_PANEL;
+    }
+    if (!g_touch_down)
+        return g_softpad_touch_mode != SOFTPAD_TOUCH_GAME;
+    if (g_softpad_touch_mode == SOFTPAD_TOUCH_GAME) {
+        g_softpad_touch_mode = SOFTPAD_TOUCH_NONE;
+        return 0;
+    }
+    g_touch_down = 0;
+    if (g_softpad_touch_mode == SOFTPAD_TOUCH_FLOAT) {
+        if (!g_softpad_dragged) {
+            g_softpad_visible = !g_softpad_visible;
+            ++g_softpad_toggle_count;
+        } else
+            ++g_softpad_drag_count;
+        g_softpad_touch_mode = SOFTPAD_TOUCH_NONE;
+        softpad_request_dirty(1, 1);
+        return 1;
+    }
+    if (g_softpad_touch_mode == SOFTPAD_TOUCH_KEY) {
+        softpad_release_key(now);
+        g_softpad_touch_mode = SOFTPAD_TOUCH_NONE;
+        return 1;
+    }
+    if (g_softpad_touch_mode == SOFTPAD_TOUCH_ACTION) {
+        int action = g_softpad_active_action;
+        int released_control = softpad_key_at(x, y);
+        softpad_set_active_action(0);
+        g_softpad_touch_mode = SOFTPAD_TOUCH_NONE;
+        if (action != 0 && action == released_control)
+            softpad_activate_action(action);
+        return 1;
+    }
+    if (g_softpad_touch_mode == SOFTPAD_TOUCH_PANEL) {
+        g_softpad_touch_mode = SOFTPAD_TOUCH_NONE;
+        return 1;
+    }
+    g_softpad_touch_mode = SOFTPAD_TOUCH_NONE;
+    return 0;
+}
+
+static u32 packet_mask(const bda_gui_input_packet_t *packet) {
+    u32 mask = 0u;
+    if (packet->bytes[BDA_INPUT_PACKET_UP_INDEX] == 1u)
+        mask |= PHONEME_KEY_UP_MASK;
+    if (packet->bytes[BDA_INPUT_PACKET_DOWN_INDEX] == 1u)
+        mask |= PHONEME_KEY_DOWN_MASK;
+    if (packet->bytes[BDA_INPUT_PACKET_LEFT_INDEX] == 1u)
+        mask |= PHONEME_KEY_LEFT_MASK;
+    if (packet->bytes[BDA_INPUT_PACKET_RIGHT_INDEX] == 1u)
+        mask |= PHONEME_KEY_RIGHT_MASK;
+    if (packet->bytes[BDA_INPUT_PACKET_ESCAPE_INDEX] == 1u)
+        mask |= PHONEME_KEY_ESCAPE_MASK;
+    if (packet->bytes[BDA_INPUT_PACKET_ENTER_INDEX] == 1u)
+        mask |= PHONEME_KEY_ENTER_MASK;
+    return mask;
+}
+
+static s32 mask_key(u32 bit) {
+    switch (bit) {
+        case PHONEME_KEY_UP_MASK: return -1;
+        case PHONEME_KEY_DOWN_MASK: return -2;
+        case PHONEME_KEY_LEFT_MASK: return -3;
+        case PHONEME_KEY_RIGHT_MASK: return -4;
+        case PHONEME_KEY_ENTER_MASK: return -5;
+        case PHONEME_KEY_ESCAPE_MASK: return -7;
+        default: return 0;
+    }
+}
+
+static int phoneme_window_proc(bda_handle_t handle, u32 message,
+    u32 wparam, u32 lparam) {
+    (void)wparam;
+    (void)lparam;
+    if (message == BDA_MSG_DRAW_CONTEXT_ATTACH) {
+        g_frame = handle;
+    }
+    else if (message == BDA_MSG_DRAW_CONTEXT_DETACH) {
+        g_detached = 1;
+    }
+    return bda_gui_default_proc(handle, message, wparam, lparam);
+}
+
+int j2me_phoneme_bbk9588_platform_initialize(void) {
+    bda_frame_desc_t descriptor;
+    if (g_initialized)
+        return 1;
+    memset(&descriptor, 0, sizeof(descriptor));
+    memset(&g_framebuffer, 0, sizeof(g_framebuffer));
+    memset(&g_last_packet, 0, sizeof(g_last_packet));
+    j2me_native_event_queue_reset(&g_events);
+    g_detached = 0;
+    g_touch_down = 0;
+    g_present_count = 0u;
+    g_close_pump_count = 0u;
+    g_last_screen_rotated = 0;
+    g_softpad_visible = 0;
+    g_softpad_float_x = 216;
+    g_softpad_float_y = 32;
+    g_softpad_touch_mode = SOFTPAD_TOUCH_NONE;
+    g_softpad_dragged = 0;
+    g_softpad_active_key = 0;
+    g_softpad_active_action = 0;
+    g_softpad_exit_requested = 0;
+    g_softpad_drawn_float_x = g_softpad_float_x;
+    g_softpad_drawn_float_y = g_softpad_float_y;
+    g_softpad_drawn_visible = g_softpad_visible;
+    g_softpad_drawn_panel_y = softpad_panel_y();
+    g_softpad_dirty_float = 1;
+    g_softpad_dirty_panel = 0;
+    g_softpad_dirty_rect_count = 0;
+    g_softpad_toggle_count = 0u;
+    g_softpad_key_event_count = 0u;
+    g_softpad_drag_count = 0u;
+    g_softpad_exit_count = 0u;
+    g_softpad_volume_action_count = 0u;
+    g_softpad_release_fallback_count = 0u;
+    g_raw_event_fetch_count = 0u;
+    g_raw_touch_event_count = 0u;
+    g_raw_touch_move_count = 0u;
+    g_input_sample_tick = 0xffffffffu;
+    descriptor.title = "J2ME";
+    descriptor.wndproc = phoneme_window_proc;
+    descriptor.height = J2ME_PHONEME_SCREEN_WIDTH;
+    descriptor.width = J2ME_PHONEME_SCREEN_HEIGHT;
+    g_frame = bda_gui_register_frame_desc(&descriptor);
+    if (g_frame == NULL || (s32)g_frame == -1)
+        return 0;
+    (void)bda_gui_frame_activate(g_frame, 0x100u);
+    if (bda_gui_framebuffer_acquire(&g_framebuffer) != 0)
+        goto fail;
+    g_input_arm_at = phoneme_time_ms() + PHONEME_INPUT_ARM_MS;
+    g_initialized = 1;
+    return 1;
+fail:
+    (void)bda_gui_frame_stop(g_frame);
+    (void)bda_gui_frame_release(g_frame);
+    {
+        bda_gui_message_t message;
+        u32 pumps = 0u;
+        memset(&message, 0, sizeof(message));
+        while (!g_detached && pumps++ < 128u &&
+                bda_gui_event_pump_frame_once(&message, g_frame))
+            bda_sys_delay(1u);
+    }
+    bda_gui_close_frame(g_frame);
+    g_frame = NULL;
+    return 0;
+}
+
+void j2me_phoneme_bbk9588_platform_finalize(void) {
+    bda_gui_message_t message;
+    u32 pumps = 0u;
+    if (!g_initialized)
+        return;
+    g_touch_down = 0;
+    memset(&g_framebuffer, 0, sizeof(g_framebuffer));
+    memset(&message, 0, sizeof(message));
+    (void)bda_gui_frame_stop(g_frame);
+    (void)bda_gui_frame_release(g_frame);
+    /*
+     * stop/release only starts the firmware's asynchronous detach.  Closing
+     * the frame immediately leaves it owning the system GUI and produces a
+     * black, apparently frozen screen after bda_main returns.  Pump only the
+     * closing frame until DRAW_CONTEXT_DETACH arrives (or the bounded pump
+     * reports that there is no more work), then perform the final close.
+     */
+    while (!g_detached && pumps++ < 128u &&
+            bda_gui_event_pump_frame_once(&message, g_frame))
+        bda_sys_delay(1u);
+    g_close_pump_count = pumps;
+    bda_gui_close_frame(g_frame);
+    g_frame = NULL;
+    g_initialized = 0;
+}
+
+static void sample_keys(u32 now) {
+    bda_gui_input_packet_t packet;
+    u32 previous;
+    u32 current;
+    u32 changed;
+    u32 bit;
+    memset(&packet, 0, sizeof(packet));
+    (void)bda_gui_input_packet(&packet);
+    if ((s32)(now - g_input_arm_at) < 0) {
+        memcpy(&g_last_packet, &packet, sizeof(packet));
+        return;
+    }
+    previous = packet_mask(&g_last_packet);
+    current = packet_mask(&packet);
+    /* A touch edge aliases one Escape pulse on this firmware. */
+    if (g_touch_down)
+        current &= ~PHONEME_KEY_ESCAPE_MASK;
+    changed = previous ^ current;
+    for (bit = 1u; bit <= PHONEME_KEY_ENTER_MASK; bit <<= 1) {
+        if ((changed & bit) != 0u)
+            j2me_native_event_push_key(&g_events,
+                (current & bit) != 0u ? J2ME_NATIVE_EVENT_KEY_DOWN :
+                    J2ME_NATIVE_EVENT_KEY_UP,
+                mask_key(bit), now);
+    }
+    memcpy(&g_last_packet, &packet, sizeof(packet));
+}
+
+static void sample_raw_input(u32 now) {
+    bda_gui_raw_event_t raw;
+    u32 drain;
+
+    for (drain = 0u; drain < PHONEME_RAW_EVENT_DRAIN_LIMIT; ++drain) {
+        j2me_native_event_type_t type;
+        u16 x;
+        u16 y;
+        int consumed;
+        int result;
+        ++g_raw_event_fetch_count;
+        result = bda_gui_raw_event_fetch(&raw);
+        if (result < 0 || raw.code < 0)
+            break;
+        if ((u32)raw.code != BDA_INPUT_EVENT_TOUCH_DOWN &&
+            (u32)raw.code != BDA_INPUT_EVENT_TOUCH_MOVE &&
+            (u32)raw.code != BDA_INPUT_EVENT_TOUCH_UP)
+            continue;
+        ++g_raw_touch_event_count;
+        if ((u32)raw.code == BDA_INPUT_EVENT_TOUCH_MOVE)
+            ++g_raw_touch_move_count;
+
+        /* Drain the launch tap, but never turn its residual move/up into a
+         * new MIDP gesture after the input-arm deadline. */
+        if ((s32)(now - g_input_arm_at) < 0) {
+            if ((u32)raw.code == BDA_INPUT_EVENT_TOUCH_UP) {
+                g_touch_down = 0;
+                g_softpad_touch_mode = SOFTPAD_TOUCH_NONE;
+            }
+            continue;
+        }
+        if ((u32)raw.code == BDA_INPUT_EVENT_TOUCH_MOVE && !g_touch_down)
+            continue;
+
+        bda_gui_touch_position(&x, &y);
+        if (x >= J2ME_PHONEME_SCREEN_WIDTH ||
+            y >= J2ME_PHONEME_SCREEN_HEIGHT) {
+            if ((u32)raw.code != BDA_INPUT_EVENT_TOUCH_UP ||
+                    !g_touch_down)
+                continue;
+            /* The 9588 ADC may invalidate its coordinate registers before
+             * code 11 (UP) is consumed.  Finish the active gesture at the
+             * last valid sample instead of silently cancelling it. */
+            x = g_touch_x;
+            y = g_touch_y;
+            ++g_softpad_release_fallback_count;
+        }
+
+        consumed = softpad_handle_touch(
+            (u32)raw.code == BDA_INPUT_EVENT_TOUCH_UP,
+            (s16)x, (s16)y, now);
+        g_touch_x = x;
+        g_touch_y = y;
+        if (consumed)
+            continue;
+
+        if ((u32)raw.code == BDA_INPUT_EVENT_TOUCH_UP) {
+            if (!g_touch_down)
+                continue;
+            type = J2ME_NATIVE_EVENT_TOUCH_UP;
+            g_touch_down = 0;
+        } else if ((u32)raw.code == BDA_INPUT_EVENT_TOUCH_DOWN) {
+            type = g_touch_down ? J2ME_NATIVE_EVENT_TOUCH_MOVE :
+                J2ME_NATIVE_EVENT_TOUCH_DOWN;
+            g_touch_down = 1;
+        } else {
+            type = J2ME_NATIVE_EVENT_TOUCH_MOVE;
+        }
+        j2me_native_event_push(&g_events, type, (s16)x, (s16)y, now);
+    }
+
+    /* The hardware raw stream reports code 12 for motion, but older QEMU
+     * builds only guarantee raw down/up.  While that raw lifetime is active,
+     * sample the firmware's cached logical position directly.  On hardware
+     * this also fills gaps between code-12 notifications without involving
+     * the window queue. */
+    if (g_touch_down && (s32)(now - g_input_arm_at) >= 0) {
+        u16 x;
+        u16 y;
+        bda_gui_touch_position(&x, &y);
+        if (x < J2ME_PHONEME_SCREEN_WIDTH &&
+            y < J2ME_PHONEME_SCREEN_HEIGHT &&
+            (x != g_touch_x || y != g_touch_y)) {
+            int consumed = softpad_handle_touch(0, (s16)x, (s16)y, now);
+            g_touch_x = x;
+            g_touch_y = y;
+            if (!consumed)
+                j2me_native_event_push(&g_events,
+                    J2ME_NATIVE_EVENT_TOUCH_MOVE, (s16)x, (s16)y, now);
+        }
+    }
+}
+
+int j2me_phoneme_bbk9588_poll_event(j2me_native_event_t *event) {
+    u32 tick;
+    u32 now;
+    if (!g_initialized || event == NULL)
+        return 0;
+    tick = bda_gui_tick_count_25ms();
+    if (tick != g_input_sample_tick) {
+        g_input_sample_tick = tick;
+        now = tick * 25u;
+        sample_raw_input(now);
+        sample_keys(now);
+        if (g_softpad_dirty_float || g_softpad_dirty_panel ||
+                g_softpad_dirty_rect_count != 0)
+            softpad_refresh_dirty();
+    }
+    return j2me_native_event_pop(&g_events, event);
+}
+
+int j2me_phoneme_bbk9588_is_detached(void) {
+    return g_detached;
+}
+
+int j2me_phoneme_bbk9588_take_exit_request(void) {
+    if (!g_softpad_exit_requested)
+        return 0;
+    g_softpad_exit_requested = 0;
+    return 1;
+}
+
+void j2me_phoneme_bbk9588_set_selected_jar(const char *path) {
+    if (path == NULL) {
+        g_selected_jar[0] = '\0';
+        return;
+    }
+    strncpy(g_selected_jar, path, sizeof(g_selected_jar) - 1u);
+    g_selected_jar[sizeof(g_selected_jar) - 1u] = '\0';
+}
+
+void j2me_phoneme_bbk9588_set_home_drive(char drive) {
+    k_midp_home_gbk[0] = drive == 'B' ? 'B' : 'A';
+}
+
+const char *j2me_phoneme_bbk9588_resolve_path(const char *path) {
+    size_t alias_length = sizeof(J2ME_PHONEME_HOME_ALIAS) - 1u;
+    size_t home_length = sizeof(k_midp_home_gbk) - 1u;
+    size_t suffix_length;
+    if (path != NULL && g_selected_jar[0] != '\0' &&
+        strcmp(path, J2ME_PHONEME_JAR_ALIAS) == 0)
+        return g_selected_jar;
+    if (path != NULL && strncmp(path, J2ME_PHONEME_HOME_ALIAS,
+            alias_length) == 0 &&
+            (path[alias_length] == '\0' || path[alias_length] == '\\' ||
+             path[alias_length] == '/')) {
+        suffix_length = strlen(path + alias_length);
+        if (home_length + suffix_length < sizeof(g_resolved_path)) {
+            memcpy(g_resolved_path, k_midp_home_gbk, home_length);
+            memcpy(g_resolved_path + home_length, path + alias_length,
+                suffix_length + 1u);
+            return g_resolved_path;
+        }
+    }
+    return path;
+}
+
+unsigned int j2me_phoneme_bbk9588_present_count(void) {
+    return g_present_count;
+}
+
+unsigned int j2me_phoneme_bbk9588_close_pump_count(void) {
+    return g_close_pump_count;
+}
+
+int j2me_phoneme_bbk9588_close_detached(void) {
+    return g_detached;
+}
+
+unsigned int j2me_phoneme_bbk9588_softpad_toggle_count(void) {
+    return g_softpad_toggle_count;
+}
+
+unsigned int j2me_phoneme_bbk9588_softpad_key_event_count(void) {
+    return g_softpad_key_event_count;
+}
+
+unsigned int j2me_phoneme_bbk9588_softpad_drag_count(void) {
+    return g_softpad_drag_count;
+}
+
+unsigned int j2me_phoneme_bbk9588_softpad_exit_count(void) {
+    return g_softpad_exit_count;
+}
+
+unsigned int j2me_phoneme_bbk9588_softpad_volume_action_count(void) {
+    return g_softpad_volume_action_count;
+}
+
+unsigned int j2me_phoneme_bbk9588_softpad_release_fallback_count(void) {
+    return g_softpad_release_fallback_count;
+}
+
+unsigned int j2me_phoneme_bbk9588_raw_event_fetch_count(void) {
+    return g_raw_event_fetch_count;
+}
+
+unsigned int j2me_phoneme_bbk9588_raw_touch_event_count(void) {
+    return g_raw_touch_event_count;
+}
+
+unsigned int j2me_phoneme_bbk9588_raw_touch_move_count(void) {
+    return g_raw_touch_move_count;
+}
+
+void initScreenBuffer(int width, int height) {
+    if (gxj_init_screen_buffer(width, height) != ALL_OK)
+        return;
+}
+
+void reverseScreenOrientation(void) {
+    gxj_rotate_screen_buffer(KNI_FALSE);
+}
+
+void connectFrameBuffer(void) {
+    (void)j2me_phoneme_bbk9588_platform_initialize();
+}
+
+void clearScreen(void) {
+    volatile u16 *pixels;
+    u32 count;
+    if (!g_initialized || g_framebuffer.pixels == NULL)
+        return;
+    pixels = g_framebuffer.pixels;
+    count = J2ME_PHONEME_SCREEN_WIDTH * J2ME_PHONEME_SCREEN_HEIGHT;
+    while (count-- != 0u)
+        *pixels++ = 0u;
+}
+
+void resizeScreenBuffer(int width, int height) {
+    (void)gxj_resize_screen_buffer(width, height);
+}
+
+int getScreenX(int screenRotated) {
+    (void)screenRotated;
+    return 0;
+}
+
+int getScreenY(int screenRotated) {
+    (void)screenRotated;
+    return 0;
+}
+
+static void present_rect(int x1, int y1, int x2, int y2, int rotated) {
+    gxj_pixel_type *source = gxj_system_screen_buffer.pixelData;
+    volatile u16 *destination = g_framebuffer.pixels;
+    int width = gxj_system_screen_buffer.width;
+    int height = gxj_system_screen_buffer.height;
+    int x;
+    int y;
+    if (!g_initialized || source == NULL || destination == NULL)
+        return;
+    if (x1 < 0) x1 = 0;
+    if (y1 < 0) y1 = 0;
+    if (x2 > width) x2 = width;
+    if (y2 > height) y2 = height;
+    g_last_screen_rotated = rotated;
+    for (y = y1; y < y2; ++y) {
+        for (x = x1; x < x2; ++x) {
+            int dx = x;
+            int dy = y;
+            u16 pixel = (u16)source[y * width + x];
+            if (rotated) {
+                dx = height - 1 - y;
+                dy = x;
+            }
+            /* The panel was already composed when it opened.  Keep those
+             * physical pixels stable while Java continues updating its own
+             * screen buffer behind them; closing restores the latest Java
+             * pixels.  This removes about 40k blends/hit-tests per game
+             * present and prevents the overlay from starving PCM writes. */
+            if (softpad_inside_panel(dx, dy))
+                continue;
+            if (softpad_covers_pixel(dx, dy))
+                pixel = softpad_composite_pixel(dx, dy, pixel);
+            if (g_framebuffer.rotate_180) {
+                dx = J2ME_PHONEME_SCREEN_WIDTH - 1 - dx;
+                dy = J2ME_PHONEME_SCREEN_HEIGHT - 1 - dy;
+            }
+            if (dx >= 0 && dx < J2ME_PHONEME_SCREEN_WIDTH &&
+                dy >= 0 && dy < J2ME_PHONEME_SCREEN_HEIGHT)
+                destination[dy * J2ME_PHONEME_SCREEN_WIDTH + dx] =
+                    pixel;
+        }
+    }
+#if defined(__mips__)
+    __asm__ volatile("sync" ::: "memory");
+#endif
+    ++g_present_count;
+}
+
+void refreshScreenNormal(int x1, int y1, int x2, int y2) {
+    present_rect(x1, y1, x2, y2, 0);
+}
+
+void refreshScreenRotated(int x1, int y1, int x2, int y2) {
+    present_rect(x1, y1, x2, y2, 1);
+}
+
+void finalizeFrameBuffer(void) {
+    gxj_free_screen_buffer();
+    /*
+     * midpFinalize() calls this while the BDA millisecond timer is still
+     * active.  Native frame teardown is deliberately deferred to bda_main,
+     * which first stops that timer and then drains the firmware detach.
+     */
+}
+
+int getKeyboardFd(void) { return -1; }
+int getMouseFd(void) { return -1; }

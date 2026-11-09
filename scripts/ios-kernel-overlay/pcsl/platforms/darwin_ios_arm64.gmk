@@ -1,0 +1,25 @@
+# PCSL platform definition for arm64-apple-ios (replaces linux_mips_gcc.gmk)
+#
+# 与 MIPS 版的差别：
+#   - 去掉 -EL/-march=mips32/-msoft-float/-mno-abicalls/-G0/-fno-pic
+#   - 去掉 -ffreestanding -fno-builtin（iOS 有完整 libSystem）
+#   - 用 xcrun clang + -target arm64-apple-ios15.0 -isysroot <iPhoneOS.sdk>
+#   - FILE_MODULE 改回 unix（iOS 是 POSIX），不再用 bbk9588 固件文件端口
+PCSL_OS=darwin
+PCSL_CPU=arm64
+
+PCSL_CHUNKMEM_IMPL=pcsl_chunkheap
+PCSL_CHUNKMEM_DIR=$(PCSL_DIR)/memory/heap
+
+include $(PCSL_DIR)/makefiles/share/gcc.gmk
+include $(PCSL_DIR)/makefiles/share/linux.gmk
+
+FILE_MODULE=unix
+
+CFLAGS += -target arm64-apple-ios15.0 \
+          -isysroot $(IOS_SDK) \
+          -miphoneos-version-min=15.0 \
+          -fPIC -O2 -Wall \
+          -I$(IOS_OVERLAY_INCLUDE) \
+          -I$(IOS_PLATFORM_INCLUDE) \
+          -I$(IOS_KERNEL_INCLUDE)

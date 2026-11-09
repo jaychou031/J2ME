@@ -1,0 +1,590 @@
+#include <stdio.h>
+#include <stdlib.h>
+#include <string.h>
+#include <setjmp.h>
+
+#include "bda_sdk.h"
+#include "platform/bbk9588/phoneme_audio.h"
+#include "platform/bbk9588/phoneme_bbk9588_port.h"
+
+#ifndef J2ME_PHONEME_EMULATOR_AUTORUN
+#define J2ME_FS_GETCWD_OFFSET 0x050u
+#endif
+
+extern int runMidlet(int argc, char **argv);
+extern void bda_run_init_array(void);
+extern unsigned int j2me9588_alloc_current(void);
+extern unsigned int j2me9588_alloc_peak(void);
+extern unsigned int j2me9588_alloc_limit(void);
+extern void j2me9588_set_exit_environment(unsigned long *environment);
+extern void j2me9588_clear_exit_environment(void);
+extern int j2me9588_exit_status(void);
+extern volatile int j2me_phoneme_midp_init_stage;
+extern volatile int j2me_phoneme_midp_init_status;
+extern volatile int j2me_phoneme_storage_init_stage;
+extern volatile int j2me_phoneme_run_stage;
+extern volatile int j2me_phoneme_run_status;
+extern const char *j2me9588_stdio_trace(void);
+extern const unsigned char _binary_phoneme_skin_bin_start[];
+extern const unsigned char _binary_phoneme_skin_bin_end[];
+#ifndef J2ME_PHONEME_INTERNAL_ROM
+extern const unsigned char _binary_phoneme_runtime_pack_bin_start[];
+extern const unsigned char _binary_phoneme_runtime_pack_bin_end[];
+extern unsigned char _rom_text_block0[];
+extern unsigned char _rom_text_block1[];
+extern unsigned char _rom_text_block2[];
+extern unsigned char _rom_text_block3[];
+extern unsigned char _rom_text_block4[];
+extern unsigned char _rom_text_block5[];
+extern unsigned char _rom_text_block6[];
+extern unsigned char _rom_text_block7[];
+extern unsigned char _rom_text_block8[];
+extern unsigned char _rom_text_block9[];
+extern const int _rom_text_block0_size;
+extern const int _rom_text_block1_size;
+extern const int _rom_text_block2_size;
+extern const int _rom_text_block3_size;
+extern const int _rom_text_block4_size;
+extern const int _rom_text_block5_size;
+extern const int _rom_text_block6_size;
+extern const int _rom_text_block7_size;
+extern const int _rom_text_block8_size;
+extern const int _rom_text_block9_size;
+#endif
+
+#ifndef J2ME_PHONEME_EMULATOR_AUTORUN
+static bda_file_selector_t g_selector;
+#endif
+static char g_selected_path[BDA_FILE_SELECTOR_PATH_SIZE];
+
+#ifndef J2ME_PHONEME_EMULATOR_AUTORUN
+static const char k_game_drive_a[] = "A:\\";
+static const char k_game_drive_b[] = "B:\\";
+static const char k_game_dir_a[] = "A:\\J2ME";
+static const char k_game_dir_b[] = "B:\\J2ME";
+static const char k_game_root_a[] = "A:\\J2ME\\";
+static const char k_game_root_b[] = "B:\\J2ME\\";
+#endif
+static char k_log_path_gbk[] =
+    "A:\\" "\xd3\xa6\xd3\xc3" "\\" "\xca\xfd\xbe\xdd" "\\J2ME\\J2MEPHONE.LOG";
+#ifdef J2ME_PHONEME_EMULATOR_AUTORUN
+static const char k_emulator_test_jar[] = "A:\\J2ME\\AGE3.JAR";
+#endif
+
+/* Firmware filesystem strings are GBK. */
+static char k_data_app[] =
+    "A:\\" "\xd3\xa6\xd3\xc3";
+static char k_data_root[] =
+    "A:\\" "\xd3\xa6\xd3\xc3" "\\" "\xca\xfd\xbe\xdd";
+static char k_midp_home_gbk[] =
+    "A:\\" "\xd3\xa6\xd3\xc3" "\\" "\xca\xfd\xbe\xdd" "\\J2ME";
+static char k_midp_appdb_gbk[] =
+    "A:\\" "\xd3\xa6\xd3\xc3" "\\" "\xca\xfd\xbe\xdd" "\\J2ME\\appdb";
+static char k_midp_lib_gbk[] =
+    "A:\\" "\xd3\xa6\xd3\xc3" "\\" "\xca\xfd\xbe\xdd" "\\J2ME\\lib";
+static char k_midp_skin_gbk[] =
+    "A:\\" "\xd3\xa6\xd3\xc3" "\\" "\xca\xfd\xbe\xdd" "\\J2ME\\lib\\skin.bin";
+#ifndef J2ME_PHONEME_INTERNAL_ROM
+static char k_midp_runtime_marker_gbk[] =
+    "A:\\" "\xd3\xa6\xd3\xc3" "\\" "\xca\xfd\xbe\xdd" "\\J2ME\\lib\\.j2pk2";
+#endif
+static char k_midp_rms_gbk[] =
+    "A:\\" "\xd3\xa6\xd3\xc3" "\\" "\xca\xfd\xbe\xdd" "\\J2ME\\rms";
+static const char k_midp_home_b_probe_gbk[] =
+    "B:\\" "\xd3\xa6\xd3\xc3" "\\" "\xca\xfd\xbe\xdd" "\\J2ME\\*.*";
+
+/* Keep command-line conversion ASCII-only. The PCSL resolver maps this
+ * private alias onto the selected drive's \应用\数据\J2ME in firmware GBK. */
+static char k_launcher_path[] = J2ME_PHONEME_HOME_ALIAS "\\runMidlet";
+
+#ifndef J2ME_PHONEME_EMULATOR_AUTORUN
+static const char *select_game_root(void) {
+    /* Probe the drive itself so an empty B:\J2ME directory is still valid. */
+    if (bda_fs_chdir(k_game_drive_b) == 0) {
+        (void)bda_fs_mkdir(k_game_dir_b);
+        if (bda_fs_chdir(k_game_dir_b) == 0)
+            return k_game_root_b;
+    }
+    (void)bda_fs_chdir(k_game_drive_a);
+    (void)bda_fs_mkdir(k_game_dir_a);
+    (void)bda_fs_chdir(k_game_dir_a);
+    return k_game_root_a;
+}
+
+static int has_jar_extension(const char *path) {
+    size_t length = path != NULL ? strlen(path) : 0u;
+    char j;
+    char a;
+    char r;
+    if (length <= 4u || path[length - 4u] != '.')
+        return 0;
+    j = path[length - 3u];
+    a = path[length - 2u];
+    r = path[length - 1u];
+    if (j >= 'A' && j <= 'Z') j = (char)(j + ('a' - 'A'));
+    if (a >= 'A' && a <= 'Z') a = (char)(a + ('a' - 'A'));
+    if (r >= 'A' && r <= 'Z') r = (char)(r + ('a' - 'A'));
+    return j == 'j' && a == 'a' && r == 'r';
+}
+
+/* On this firmware the modal selector returns the leaf under its old path,
+ * while the current directory contains the authoritative selected folder. */
+static int rebase_selector_path(void) {
+    const char *leaf;
+    const char *slash;
+    int required = bda_sdk_internal_call2(bda_sdk_internal_fs(),
+        J2ME_FS_GETCWD_OFFSET, (u32)g_selected_path,
+        (u32)sizeof(g_selected_path));
+    if (required <= 0 || (u32)required > sizeof(g_selected_path) ||
+            g_selected_path[0] == '\0')
+        return 0;
+    leaf = strrchr(g_selector.path, '\\');
+    slash = strrchr(g_selector.path, '/');
+    if (slash != NULL && (leaf == NULL || slash > leaf))
+        leaf = slash;
+    leaf = leaf == NULL ? g_selector.path : leaf + 1;
+    if (leaf[0] == '\0' || !bda_dialogs_internal_join_path(g_selected_path,
+            sizeof(g_selected_path), leaf))
+        return 0;
+    return 1;
+}
+#endif
+
+static void select_runtime_drive(void) {
+    bda_fs_find_data_t find;
+    char drive = 'A';
+    bda_fs_find_data_init(&find);
+    if (bda_fs_findfirst(k_midp_home_b_probe_gbk, 0x27u, &find) != -1) {
+        (void)bda_fs_findclose(&find);
+        drive = 'B';
+    }
+    k_data_app[0] = drive;
+    k_data_root[0] = drive;
+    k_midp_home_gbk[0] = drive;
+    k_midp_appdb_gbk[0] = drive;
+    k_midp_lib_gbk[0] = drive;
+    k_midp_skin_gbk[0] = drive;
+    k_log_path_gbk[0] = drive;
+#ifndef J2ME_PHONEME_INTERNAL_ROM
+    k_midp_runtime_marker_gbk[0] = drive;
+#endif
+    k_midp_rms_gbk[0] = drive;
+    j2me_phoneme_bbk9588_set_home_drive(drive);
+}
+
+static void ensure_runtime_directories(void) {
+    (void)bda_fs_mkdir(k_data_app);
+    (void)bda_fs_mkdir(k_data_root);
+    (void)bda_fs_mkdir(k_midp_home_gbk);
+    (void)bda_fs_mkdir(k_midp_appdb_gbk);
+    (void)bda_fs_mkdir(k_midp_lib_gbk);
+    (void)bda_fs_mkdir(k_midp_rms_gbk);
+}
+
+static int write_embedded_skin(void) {
+    const unsigned char *data = _binary_phoneme_skin_bin_start;
+    u32 length = (u32)(_binary_phoneme_skin_bin_end - data);
+    int file = bda_fs_fopen_raw(k_midp_skin_gbk, "wb");
+    int written;
+    if (!bda_fs_file_is_valid(file))
+        return 0;
+    written = bda_fs_write_raw(file, data, length);
+    (void)bda_fs_close_raw(file);
+    return written == (int)length;
+}
+
+#ifndef J2ME_PHONEME_INTERNAL_ROM
+static u16 read_little_u16(const unsigned char *data) {
+    return (u16)((u16)data[0] | ((u16)data[1] << 8));
+}
+
+static u32 read_little_u32(const unsigned char *data) {
+    return (u32)data[0] | ((u32)data[1] << 8) |
+        ((u32)data[2] << 16) | ((u32)data[3] << 24);
+}
+
+typedef struct runtime_pack_reader {
+    const unsigned char *cursor;
+    u32 remaining;
+} runtime_pack_reader_t;
+
+typedef struct runtime_pack_file {
+    void *state;
+    long (*size)(void *state);
+    long (*read)(void *state, unsigned char *buffer, long count);
+    int (*seek)(void *state, long offset, int whence);
+    int (*read_char)(void *state);
+} runtime_pack_file_t;
+
+typedef struct runtime_pack_heap {
+    void *state;
+    void *(*allocate)(void *state, int size);
+    void (*release)(void *state, void *memory);
+    void *(*address)(void *state, void *memory);
+} runtime_pack_heap_t;
+
+extern int inflateData(runtime_pack_file_t *file,
+    runtime_pack_heap_t *heap, int compressed_length,
+    unsigned char *output, int output_length, int output_is_handle);
+
+static long runtime_pack_read(void *state, unsigned char *buffer, long count) {
+    runtime_pack_reader_t *reader = (runtime_pack_reader_t *)state;
+    u32 requested;
+    if (count <= 0)
+        return 0;
+    requested = (u32)count;
+    if (requested > reader->remaining)
+        requested = reader->remaining;
+    memcpy(buffer, reader->cursor, requested);
+    reader->cursor += requested;
+    reader->remaining -= requested;
+    return (long)requested;
+}
+
+static void *runtime_pack_allocate(void *state, int size) {
+    (void)state;
+    return size > 0 ? malloc((size_t)size) : NULL;
+}
+
+static void runtime_pack_release(void *state, void *memory) {
+    (void)state;
+    free(memory);
+}
+
+static void *runtime_pack_address(void *state, void *memory) {
+    (void)state;
+    return memory;
+}
+
+static int install_rom_text_pack(const unsigned char *cursor,
+        const unsigned char *end) {
+    unsigned char *blocks[10];
+    const int *block_sizes[10];
+    u32 count;
+    u32 index;
+
+    blocks[0] = _rom_text_block0;
+    blocks[1] = _rom_text_block1;
+    blocks[2] = _rom_text_block2;
+    blocks[3] = _rom_text_block3;
+    blocks[4] = _rom_text_block4;
+    blocks[5] = _rom_text_block5;
+    blocks[6] = _rom_text_block6;
+    blocks[7] = _rom_text_block7;
+    blocks[8] = _rom_text_block8;
+    blocks[9] = _rom_text_block9;
+    block_sizes[0] = &_rom_text_block0_size;
+    block_sizes[1] = &_rom_text_block1_size;
+    block_sizes[2] = &_rom_text_block2_size;
+    block_sizes[3] = &_rom_text_block3_size;
+    block_sizes[4] = &_rom_text_block4_size;
+    block_sizes[5] = &_rom_text_block5_size;
+    block_sizes[6] = &_rom_text_block6_size;
+    block_sizes[7] = &_rom_text_block7_size;
+    block_sizes[8] = &_rom_text_block8_size;
+    block_sizes[9] = &_rom_text_block9_size;
+
+    if ((size_t)(end - cursor) < 8u || memcmp(cursor, "J2RZ", 4u) != 0)
+        return 0;
+    count = read_little_u32(cursor + 4u);
+    cursor += 8u;
+    if (count != 10u)
+        return 0;
+
+    for (index = 0u; index < count; ++index) {
+        u32 output_length;
+        u32 compressed_length;
+        runtime_pack_reader_t reader;
+        runtime_pack_file_t file;
+        runtime_pack_heap_t heap;
+
+        if ((size_t)(end - cursor) < 12u)
+            return 0;
+        output_length = read_little_u32(cursor);
+        compressed_length = read_little_u32(cursor + 4u);
+        cursor += 8u;
+        if (output_length != (u32)*block_sizes[index] ||
+                compressed_length > (u32)(end - cursor - 4u))
+            return 0;
+
+        memset(&file, 0, sizeof(file));
+        memset(&heap, 0, sizeof(heap));
+        reader.cursor = cursor;
+        reader.remaining = compressed_length + 4u;
+        file.state = &reader;
+        file.read = runtime_pack_read;
+        heap.allocate = runtime_pack_allocate;
+        heap.release = runtime_pack_release;
+        heap.address = runtime_pack_address;
+        if (inflateData(&file, &heap, (int)compressed_length,
+                blocks[index], (int)output_length, 0) != 0)
+            return 0;
+        cursor += compressed_length + 4u;
+    }
+
+    return cursor == end;
+}
+
+static int runtime_pack_is_installed(void) {
+    int file = bda_fs_fopen_raw(k_midp_runtime_marker_gbk, "rb");
+    if (!bda_fs_file_is_valid(file))
+        return 0;
+    (void)bda_fs_close_raw(file);
+    return 1;
+}
+
+static int install_embedded_runtime_pack(void) {
+    const unsigned char *cursor = _binary_phoneme_runtime_pack_bin_start;
+    const unsigned char *end = _binary_phoneme_runtime_pack_bin_end;
+    unsigned char *decompressed = NULL;
+    u32 count;
+    u32 index;
+    size_t root_length = strlen(k_midp_lib_gbk);
+    char path[384];
+    int marker;
+    int result = 0;
+
+    if ((size_t)(end - cursor) >= 8u && memcmp(cursor, "J2RZ", 4u) == 0)
+        return install_rom_text_pack(cursor, end);
+    if (runtime_pack_is_installed())
+        return 1;
+    if ((size_t)(end - cursor) >= 16u &&
+            memcmp(cursor, "J2PZ", 4u) == 0) {
+        u32 output_length = read_little_u32(cursor + 4u);
+        u32 compressed_length = read_little_u32(cursor + 8u);
+        runtime_pack_reader_t reader;
+        runtime_pack_file_t file;
+        runtime_pack_heap_t heap;
+        if (output_length < 8u || output_length > 1024u * 1024u ||
+                compressed_length > (u32)(end - cursor - 16u))
+            goto cleanup;
+        decompressed = (unsigned char *)malloc(output_length);
+        if (decompressed == NULL)
+            goto cleanup;
+        memset(&file, 0, sizeof(file));
+        memset(&heap, 0, sizeof(heap));
+        reader.cursor = cursor + 12u;
+        reader.remaining = compressed_length + 4u;
+        file.state = &reader;
+        file.read = runtime_pack_read;
+        heap.allocate = runtime_pack_allocate;
+        heap.release = runtime_pack_release;
+        heap.address = runtime_pack_address;
+        if (inflateData(&file, &heap, (int)compressed_length,
+                decompressed, (int)output_length, 0) != 0)
+            goto cleanup;
+        cursor = decompressed;
+        end = decompressed + output_length;
+    }
+    if ((size_t)(end - cursor) < 8u || memcmp(cursor, "J2PK", 4u) != 0)
+        goto cleanup;
+    count = read_little_u32(cursor + 4u);
+    cursor += 8u;
+    if (root_length + 2u >= sizeof(path))
+        goto cleanup;
+    memcpy(path, k_midp_lib_gbk, root_length);
+    path[root_length] = '\\';
+
+    for (index = 0u; index < count; ++index) {
+        u16 name_length;
+        u32 data_length;
+        int file;
+        int written;
+        if ((size_t)(end - cursor) < 6u)
+            goto cleanup;
+        name_length = read_little_u16(cursor);
+        data_length = read_little_u32(cursor + 2u);
+        cursor += 6u;
+        if (name_length == 0u || root_length + 1u + name_length + 1u >
+                sizeof(path) || (size_t)(end - cursor) < name_length)
+            goto cleanup;
+        memcpy(path + root_length + 1u, cursor, name_length);
+        path[root_length + 1u + name_length] = '\0';
+        cursor += name_length;
+        if ((size_t)(end - cursor) < data_length)
+            goto cleanup;
+        file = bda_fs_fopen_raw(path, "wb");
+        if (!bda_fs_file_is_valid(file))
+            goto cleanup;
+        written = bda_fs_write_raw(file, cursor, data_length);
+        (void)bda_fs_close_raw(file);
+        if (written != (int)data_length)
+            goto cleanup;
+        cursor += data_length;
+    }
+
+    marker = bda_fs_fopen_raw(k_midp_runtime_marker_gbk, "wb");
+    if (!bda_fs_file_is_valid(marker))
+        goto cleanup;
+    index = (u32)bda_fs_write_raw(marker, "J2PK2", 5u);
+    (void)bda_fs_close_raw(marker);
+    result = index == 5u;
+cleanup:
+    free(decompressed);
+    return result;
+}
+#else
+static int install_embedded_runtime_pack(void) {
+    return 1;
+}
+#endif
+
+static void write_status(const char *stage, int status) {
+    char report[3072];
+    int length = snprintf(report, sizeof(report),
+        "RUNTIME=PHONEME_FEATURE_MR2\r\n"
+        "STAGE=%s\r\n"
+        "STATUS=%d\r\n"
+        "GAME_JAR=%s\r\n"
+        "ALLOC_CURRENT=%u\r\n"
+        "ALLOC_PEAK=%u\r\n"
+        "ALLOC_LIMIT=%u\r\n"
+        "MIDP_INIT_STAGE=%d\r\n"
+        "MIDP_INIT_STATUS=%d\r\n"
+        "STORAGE_INIT_STAGE=%d\r\n"
+        "RUN_STAGE=%d\r\n"
+        "RUN_STATUS=%d\r\n"
+        "PRESENTS=%u\r\n"
+        "FRAME_CLOSE_PUMPS=%u\r\n"
+        "FRAME_DETACHED=%s\r\n"
+        "SOFTPAD_TOGGLES=%u\r\n"
+        "SOFTPAD_KEY_EVENTS=%u\r\n"
+        "SOFTPAD_DRAGS=%u\r\n"
+        "SOFTPAD_EXITS=%u\r\n"
+        "SOFTPAD_VOLUME_ACTIONS=%u\r\n"
+        "SOFTPAD_RELEASE_FALLBACKS=%u\r\n"
+        "RAW_EVENT_FETCHES=%u\r\n"
+        "RAW_TOUCH_EVENTS=%u\r\n"
+        "RAW_TOUCH_MOVES=%u\r\n"
+        "AUDIO_STARTS=%u\r\n"
+        "AUDIO_MIDI_STARTS=%u\r\n"
+        "AUDIO_WAV_STARTS=%u\r\n"
+        "AUDIO_TONES=%u\r\n"
+        "AUDIO_STOPS=%u\r\n"
+        "AUDIO_NOTES=%u\r\n"
+        "AUDIO_WRITE_CALLS=%u\r\n"
+        "AUDIO_WRITE_BYTES=%u\r\n"
+        "AUDIO_WRITE_ERRORS=%u\r\n"
+        "AUDIO_READY_MISSES=%u\r\n"
+        "AUDIO_MASTER_VOLUME=%u\r\n"
+        "AUDIO_MASTER_MUTED=%s\r\n"
+        "AUDIO_MASTER_CHANGES=%u\r\n"
+        "--- TERMINAL ---\r\n%s",
+        stage, status, g_selected_path,
+        j2me9588_alloc_current(), j2me9588_alloc_peak(),
+        j2me9588_alloc_limit(), j2me_phoneme_midp_init_stage,
+        j2me_phoneme_midp_init_status,
+        j2me_phoneme_storage_init_stage,
+        j2me_phoneme_run_stage, j2me_phoneme_run_status,
+        j2me_phoneme_bbk9588_present_count(),
+        j2me_phoneme_bbk9588_close_pump_count(),
+        j2me_phoneme_bbk9588_close_detached() ? "YES" : "NO",
+        j2me_phoneme_bbk9588_softpad_toggle_count(),
+        j2me_phoneme_bbk9588_softpad_key_event_count(),
+        j2me_phoneme_bbk9588_softpad_drag_count(),
+        j2me_phoneme_bbk9588_softpad_exit_count(),
+        j2me_phoneme_bbk9588_softpad_volume_action_count(),
+        j2me_phoneme_bbk9588_softpad_release_fallback_count(),
+        j2me_phoneme_bbk9588_raw_event_fetch_count(),
+        j2me_phoneme_bbk9588_raw_touch_event_count(),
+        j2me_phoneme_bbk9588_raw_touch_move_count(),
+        j2me_phoneme_audio_start_count(),
+        j2me_phoneme_audio_midi_start_count(),
+        j2me_phoneme_audio_wav_start_count(),
+        j2me_phoneme_audio_tone_count(),
+        j2me_phoneme_audio_stop_count(),
+        j2me_phoneme_audio_note_count(),
+        j2me_phoneme_audio_write_count(),
+        j2me_phoneme_audio_write_bytes(),
+        j2me_phoneme_audio_write_errors(),
+        j2me_phoneme_audio_ready_misses(),
+        j2me_phoneme_audio_master_volume(),
+        j2me_phoneme_audio_master_muted() ? "YES" : "NO",
+        j2me_phoneme_audio_master_change_count(),
+        j2me9588_stdio_trace());
+    int file;
+    if (length < 0)
+        return;
+    if ((size_t)length >= sizeof(report))
+        length = (int)sizeof(report) - 1;
+    file = bda_fs_fopen_raw(k_log_path_gbk, "wb");
+    if (bda_fs_file_is_valid(file)) {
+        (void)bda_fs_write_raw(file, report, (u32)length);
+        (void)bda_fs_close_raw(file);
+    }
+}
+
+int bda_main(void) {
+#ifndef J2ME_PHONEME_EMULATOR_AUTORUN
+    int selection;
+#endif
+    int status;
+    char *arguments[2];
+    jmp_buf exit_environment;
+    int exit_signal;
+
+    g_selected_path[0] = '\0';
+#ifdef J2ME_PHONEME_EMULATOR_AUTORUN
+    (void)strcpy(g_selected_path, k_emulator_test_jar);
+#else
+    selection = bda_gui_select_file(&g_selector, select_game_root(),
+        "jar", "Select J2ME game");
+    if (selection == BDA_FILE_SELECTOR_CANCELLED)
+        return 0;
+    if (selection != BDA_FILE_SELECTOR_SELECTED ||
+            !rebase_selector_path() ||
+            !has_jar_extension(g_selected_path)) {
+        (void)bda_msgbox("J2ME for 9588", "Invalid JAR selection");
+        return 1;
+    }
+#endif
+
+    /* The 9588 firmware only accepts the application's primary frame while
+     * bda_main still owns the launch context.  Feature phoneME normally waits
+     * until Java Display initialization calls connectFrameBuffer(), which is
+     * too late on this firmware and makes frame registration return -1. */
+    if (!j2me_phoneme_bbk9588_platform_initialize()) {
+        (void)bda_msgbox("J2ME for 9588", "Cannot initialize display");
+        return 1;
+    }
+    /* phoneME has C++ static constructors.  Running them from bda_entry is
+     * early enough to make the 9588 firmware reject its primary framebuffer.
+     * The launcher itself is plain C, so initialize phoneME only after the
+     * firmware has accepted the frame descriptor. */
+    select_runtime_drive();
+    ensure_runtime_directories();
+    if (!write_embedded_skin()) {
+        j2me_phoneme_bbk9588_platform_finalize();
+        (void)bda_msgbox("J2ME for 9588", "Cannot create phoneME skin.bin");
+        return 1;
+    }
+    if (!install_embedded_runtime_pack()) {
+        j2me_phoneme_bbk9588_platform_finalize();
+        (void)bda_msgbox("J2ME for 9588", "Cannot install phoneME skin assets");
+        return 1;
+    }
+    bda_run_init_array();
+    j2me_phoneme_bbk9588_set_selected_jar(g_selected_path);
+    bda_gui_millisecond_timer_start();
+    write_status("STARTING", 0);
+
+    arguments[0] = k_launcher_path;
+    arguments[1] = (char *)J2ME_PHONEME_JAR_ALIAS;
+    j2me9588_set_exit_environment(exit_environment[0].words);
+    exit_signal = setjmp(exit_environment);
+    if (exit_signal == 0)
+        status = runMidlet(2, arguments);
+    else
+        status = j2me9588_exit_status();
+    j2me9588_clear_exit_environment();
+
+    j2me_phoneme_audio_stop();
+    bda_gui_millisecond_timer_stop();
+    j2me_phoneme_bbk9588_platform_finalize();
+    write_status("FINISHED", status);
+    if (status != 0 && status != 1) {
+        (void)bda_msgbox("J2ME for 9588",
+            "phoneME could not run this game. See J2MEPHONE.LOG in app data");
+    }
+    return status;
+}

@@ -1,0 +1,27 @@
+# 手机端最省事版：把这段粘贴到 .github/workflows/bootstrap.yml，再上传 ZIP。
+# 比完整版短一半以上，功能相同（解压 / 铺开 / 恢复权限 / 提交 / 派发构建）。
+name: 00 Bootstrap
+on: [push, workflow_dispatch]
+permissions: { contents: write, actions: write }
+jobs:
+  b:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          BRANCH: ${{ github.event.repository.default_branch }}
+        run: |
+          set -e
+          z=$(ls *.zip 2>/dev/null | head -1) || true
+          [ -n "$z" ] || exit 0
+          unzip -q "$z" -d t
+          cp -a t/*/. .
+          rm -rf t "$z"
+          chmod +x scripts/*.sh
+          git config user.name  bot
+          git config user.email bot@users.noreply.github.com
+          git add -A
+          git commit -m init || true
+          git push origin "HEAD:$BRANCH"
+          for i in 1 2 3 4 5; do gh workflow run ios.yml --ref "$BRANCH" && break; sleep 3; done

@@ -1,0 +1,87 @@
+# ============================================================================
+# 手机上传专用「引导 workflow」
+#
+# 用法（在 iPhone Safari 桌面版网页里）：
+#   Add file → Create new file
+#   文件名填：  .github/workflows/bootstrap.yml
+#   内容粘贴：  本文件全部内容
+#   Commit changes
+#
+# 作用：把仓库根目录里的 BBK9588-J2ME-iOS.zip 解压、铺到仓库根目录、
+#       恢复脚本可执行权限、提交推送、删掉 ZIP，然后显式派发主构建。
+#       之后每次 push 它都会自动跳过（根目录已无 ZIP）。
+#
+# 这段逻辑自包含，不依赖 ZIP 里的任何脚本，因此早期下载的旧 ZIP 也能用。
+# ============================================================================
+name: 00 · Bootstrap（展开手机上传的工程）
+
+on: [push, workflow_dispatch]
+
+# 关键：必须写权限，才能把解压出来的文件提交回仓库
+permissions:
+  contents: write
+  actions: write
+
+jobs:
+  bootstrap:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: 展开工程并派发构建
+        env:
+          DEFAULT_BRANCH: ${{ github.event.repository.default_branch }}
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          set -euo pipefail
+
+          # 只在根目录还有 ZIP 时干活；自举完成后秒退
+          ZIP=""
+          for f in ./*.zip ./*.ZIP; do
+            [ -f "$f" ] || continue
+            ZIP="$f"
+            break
+          done
+          if [ -z "$ZIP" ]; then
+            echo "根目录没有待展开的 ZIP，已自举完成，跳过。"
+            exit 0
+          fi
+          echo "找到压缩包：$ZIP"
+
+          rm -rf .unpack && mkdir .unpack
+          unzip -q "$ZIP" -d .unpack
+          SRC=""
+          for d in .unpack/*/; do
+            [ -d "$d" ] || continue
+            SRC="$d"
+            break
+          done
+          if [ -z "$SRC" ]; then
+            echo "::error::ZIP 里没有顶层目录 BBK9588-J2ME-iOS/"
+            exit 1
+          fi
+
+          # cp -a 保留隐藏文件（.github / .gitignore）与可执行位
+          cp -a "$SRC/." ./
+          rm -rf .unpack "$ZIP"
+          chmod +x scripts/*.sh 2>/dev/null || true
+
+          git config user.name  "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          git add -A
+          git commit -m "bootstrap: 展开 BBK9588-J2ME-iOS 工程" || echo "无新增文件"
+          git push origin "HEAD:$DEFAULT_BRANCH"
+          echo "已提交文件数：$(git ls-files | wc -l)"
+          echo "=== workflows ==="
+          ls -l .github/workflows/
+
+          # GITHUB_TOKEN 产生的 push 不会再触发新 workflow，所以必须显式派发。
+          # 新 workflow 文件刚 push，GitHub 索引可能有短暂延迟，重试几次。
+          OK=0
+          for i in 1 2 3 4 5; do
+            if gh workflow run ios.yml --ref "$DEFAULT_BRANCH"; then OK=1; break; fi
+            sleep 3
+          done
+          if [ "$OK" != "1" ]; then
+            echo "::warning::自动派发失败，请到 Actions 页手动点 Run workflow"
+          fi

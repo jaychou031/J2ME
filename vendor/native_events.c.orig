@@ -1,0 +1,114 @@
+#include "platform/bbk9588/native_events.h"
+
+void j2me_native_event_queue_reset(j2me_native_event_queue_t *queue) {
+    queue->read_index = 0u;
+    queue->write_index = 0u;
+    queue->dropped = 0u;
+    queue->dropped_critical = 0u;
+    queue->move_coalesced = 0u;
+    queue->peak_depth = 0u;
+}
+
+static u32 j2me_native_event_free_slots(
+    const j2me_native_event_queue_t *queue)
+{
+    u32 used = (queue->write_index + J2ME_NATIVE_EVENT_CAPACITY -
+        queue->read_index) % J2ME_NATIVE_EVENT_CAPACITY;
+    return (J2ME_NATIVE_EVENT_CAPACITY - 1u) - used;
+}
+
+static int j2me_native_event_try_coalesce_move(
+    j2me_native_event_queue_t *queue,
+    s16 x,
+    s16 y,
+    u32 timestamp_ms)
+{
+    u32 previous;
+    if (queue->read_index == queue->write_index)
+        return 0;
+    previous = (queue->write_index + J2ME_NATIVE_EVENT_CAPACITY - 1u) %
+        J2ME_NATIVE_EVENT_CAPACITY;
+    if (queue->events[previous].type != J2ME_NATIVE_EVENT_TOUCH_MOVE)
+        return 0;
+    queue->events[previous].x = x;
+    queue->events[previous].y = y;
+    queue->events[previous].timestamp_ms = timestamp_ms;
+    ++queue->move_coalesced;
+    return 1;
+}
+
+static void j2me_native_event_push_value(
+    j2me_native_event_queue_t *queue,
+    j2me_native_event_type_t type,
+    s16 x,
+    s16 y,
+    s32 key,
+    u32 timestamp_ms)
+{
+    u32 write_index;
+    u32 next_index;
+    int expendable = type == J2ME_NATIVE_EVENT_TOUCH_MOVE ||
+        type == J2ME_NATIVE_EVENT_KEY_REPEAT;
+
+    if (type == J2ME_NATIVE_EVENT_TOUCH_MOVE &&
+        j2me_native_event_try_coalesce_move(queue, x, y, timestamp_ms))
+        return;
+
+    /* Leave two slots for touch/key release ordering under move floods. */
+    if (expendable && j2me_native_event_free_slots(queue) <= 2u) {
+        ++queue->dropped;
+        return;
+    }
+    write_index = queue->write_index;
+    next_index = (write_index + 1u) % J2ME_NATIVE_EVENT_CAPACITY;
+    if (next_index == queue->read_index) {
+        ++queue->dropped;
+        if (!expendable)
+            ++queue->dropped_critical;
+        return;
+    }
+    queue->events[write_index].type = type;
+    queue->events[write_index].x = x;
+    queue->events[write_index].y = y;
+    queue->events[write_index].key = key;
+    queue->events[write_index].timestamp_ms = timestamp_ms;
+    queue->write_index = next_index;
+    {
+        u32 depth = (next_index + J2ME_NATIVE_EVENT_CAPACITY -
+            queue->read_index) % J2ME_NATIVE_EVENT_CAPACITY;
+        if (depth > queue->peak_depth)
+            queue->peak_depth = depth;
+    }
+}
+
+void j2me_native_event_push(
+    j2me_native_event_queue_t *queue,
+    j2me_native_event_type_t type,
+    s16 x,
+    s16 y,
+    u32 timestamp_ms
+) {
+    j2me_native_event_push_value(queue, type, x, y, 0, timestamp_ms);
+}
+
+void j2me_native_event_push_key(
+    j2me_native_event_queue_t *queue,
+    j2me_native_event_type_t type,
+    s32 key,
+    u32 timestamp_ms
+) {
+    j2me_native_event_push_value(queue, type, 0, 0, key, timestamp_ms);
+}
+
+int j2me_native_event_pop(
+    j2me_native_event_queue_t *queue,
+    j2me_native_event_t *event
+) {
+    u32 read_index = queue->read_index;
+
+    if (read_index == queue->write_index)
+        return 0;
+    *event = queue->events[read_index];
+    queue->read_index = (read_index + 1u) % J2ME_NATIVE_EVENT_CAPACITY;
+    return 1;
+}

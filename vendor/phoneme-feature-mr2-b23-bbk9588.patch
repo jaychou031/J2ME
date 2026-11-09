@@ -1,0 +1,1641 @@
+diff --git a/cldc/src/vm/cpu/c/AsmStubs_i386.s b/cldc/src/vm/cpu/c/AsmStubs_i386.s
+index f316c86d5f98063a62b92aa6c8d8541f866369d0..65e287ef7e3986cfe0e9e4831d046ea5d05577d7 100644
+--- a/cldc/src/vm/cpu/c/AsmStubs_i386.s
++++ b/cldc/src/vm/cpu/c/AsmStubs_i386.s
+@@ -24,7 +24,9 @@
+ # information or have any questions.
+ #
+ 
+-.arch i486
++# Modern GNU assemblers reject the x87 instructions below after `.arch i486`.
++# The host ROM generator is explicitly assembled as 32-bit, so let the
++# assembler select the baseline instruction set instead of disabling x87.
+ .text
+ .align 16
+ 
+diff --git a/cldc/src/vm/cpu/c/Interpreter_c.cpp b/cldc/src/vm/cpu/c/Interpreter_c.cpp
+index 7f883a1039e315de0ce08092984941b4df1d2551..2468d6e56bea0b63cef9993ffc36a704db5c32db 100644
+--- a/cldc/src/vm/cpu/c/Interpreter_c.cpp
++++ b/cldc/src/vm/cpu/c/Interpreter_c.cpp
+@@ -31,6 +31,10 @@
+ 
+ extern "C" {
+ 
++#if defined(MIPS)
++  extern unsigned int j2me_phoneme_bbk9588_clock_ms(void);
++#endif
++
+   // external routines used when quickening
+   extern Bytecodes::Code quicken(Thread* THREAD);
+   extern Bytecodes::Code quicken_invokestatic(Thread* THREAD);
+@@ -4473,6 +4477,31 @@ static void init() {
+ #undef MY_GUARANTEE
+ 
+ // interpreter
++#if defined(MIPS)
++static void j2me_phoneme_bbk9588_poll_tick() {
++  static unsigned int dispatches;
++  static unsigned int last_tick_ms;
++  unsigned int now;
++  unsigned int elapsed;
++
++  if ((++dispatches & 0x1ffu) != 0u) {
++    return;
++  }
++  now = j2me_phoneme_bbk9588_clock_ms();
++  if (last_tick_ms == 0u) {
++    last_tick_ms = now;
++    return;
++  }
++  elapsed = now - last_tick_ms;
++  if (elapsed >= 10u) {
++    real_time_tick((int)elapsed);
++    last_tick_ms = now;
++  }
++}
++#else
++static void j2me_phoneme_bbk9588_poll_tick() {}
++#endif
++
+ static void Interpret() {
+   // Start a new thread or continue in another existing thread
+   // after thread termination.
+@@ -4481,11 +4510,13 @@ static void Interpret() {
+   // process bytecodes in the infinite loop
+   if (TraceBytecodes) {
+     for (;;) {
++      j2me_phoneme_bbk9588_poll_tick();
+       interpreter_call_vm((address)&trace_bytecode, T_VOID);
+       interpreter_dispatch_table[*g_jpc]();
+     }
+   } else {
+     for (;;) {
++      j2me_phoneme_bbk9588_poll_tick();
+       interpreter_dispatch_table[*g_jpc]();
+     }
+   }
+diff --git a/cldc/src/vm/os/generic/FSImage_bbk9588.cpp b/cldc/src/vm/os/generic/FSImage_bbk9588.cpp
+new file mode 100644
+index 0000000000000000000000000000000000000000..b2f781965a313ee73212144afbd2d57a3c90c53d
+--- /dev/null
++++ b/cldc/src/vm/os/generic/FSImage_bbk9588.cpp
+@@ -0,0 +1,15 @@
++// Empty bootstrap filesystem for the first BBK 9588 MIPS VM gate.
++// Production JAR access is provided by the BBK filesystem port.
++extern "C" {
++
++typedef struct {
++    const char* name;
++    const unsigned char* data;
++    int length;
++} file_info;
++
++file_info fs_image_table[] = {
++    { 0, 0, 0 }
++};
++
++}
+diff --git a/cldc/src/vm/os/generic/JVM_generic.cpp b/cldc/src/vm/os/generic/JVM_generic.cpp
+index 2632ede158a19679e98ad72a05f41ac91a49ef86..faaf8339d7b6cf7fd9860c53be7c1d72e565d8bd 100644
+--- a/cldc/src/vm/os/generic/JVM_generic.cpp
++++ b/cldc/src/vm/os/generic/JVM_generic.cpp
+@@ -37,7 +37,7 @@
+ #include "incls/_precompiled.incl"
+ #include "incls/_JVM_generic.cpp.incl"
+ 
+-extern "C" int JVM_Start(const char *classpath, char *main_class, int argc,
++extern "C" int JVM_Start(const JvmPathChar *classpath, char *main_class, int argc,
+                          char **argv) {
+   JVM::set_arguments(classpath, main_class, argc, argv);
+ 
+@@ -49,7 +49,7 @@ extern "C" int JVM_Start(const char *classpath, char *main_class, int argc,
+   return result;
+ }
+ 
+-extern "C" int JVM_Start2(const char *classpath, char *main_class, int argc,
++extern "C" int JVM_Start2(const JvmPathChar *classpath, char *main_class, int argc,
+                           jchar **u_argv) {
+   JVM::set_arguments2(classpath, main_class, argc, NULL, u_argv, true);
+  
+diff --git a/cldc/src/vm/os/generic/OS_generic.cpp b/cldc/src/vm/os/generic/OS_generic.cpp
+index 4a539ee949dbba78bad3289dc9854f8eaef10417..ced0d21560ede9cec848da644bcca799a970a542 100644
+--- a/cldc/src/vm/os/generic/OS_generic.cpp
++++ b/cldc/src/vm/os/generic/OS_generic.cpp
+@@ -37,6 +37,9 @@
+ #include "incls/_precompiled.incl"
+ #include "incls/_OS_generic.cpp.incl"
+ 
++extern "C" unsigned int j2me_phoneme_bbk9588_clock_ms(void);
++extern "C" void j2me_phoneme_bbk9588_sleep_ms(unsigned int milliseconds);
++
+ static bool             ticker_stopping = false;
+ static bool             ticker_running = false;
+ static int              sock_initialized = 0;
+@@ -71,11 +74,18 @@ jlong Os::java_time_millis() {
+    * Jan. 1st, 1970. Need reduce the OS dependent offset time value, if
+    * the offset exist
+    */
+-  return 0;
++  return (jlong)j2me_phoneme_bbk9588_clock_ms();
+ }
+ 
+ void Os::sleep(jlong ms) {
+   /* let the current process sleep for ms seconds */
++  if (ms <= 0) {
++    return;
++  }
++  if (ms > (jlong)0xffffffff) {
++    ms = (jlong)0xffffffff;
++  }
++  j2me_phoneme_bbk9588_sleep_ms((unsigned int)ms);
+ }
+ 
+ 
+@@ -159,7 +169,7 @@ jlong Os::elapsed_counter() {
+    * Retrieve the current time in high-resolution.
+    * The resolution is decided by elapsed_frequency() method
+    */
+-  return 0;
++  return (jlong)j2me_phoneme_bbk9588_clock_ms();
+ }
+ 
+ jlong Os::elapsed_frequency() {
+@@ -168,7 +178,7 @@ jlong Os::elapsed_frequency() {
+    * The return value is equal to  1s / the small unit of system-support unit
+    * For example, if system support millisecond, the return valuse is 1000
+    */
+-  return 0;
++  return 1000;
+ }
+ 
+ #endif // PRODUCT
+diff --git a/cldc/src/vm/os/generic/OsFile_generic.cpp b/cldc/src/vm/os/generic/OsFile_generic.cpp
+index 96d6d82187be9afbf4b850a535e9ae7c4690b987..fea2b013a556c78242f67731f789f25e7e7f5156 100644
+--- a/cldc/src/vm/os/generic/OsFile_generic.cpp
++++ b/cldc/src/vm/os/generic/OsFile_generic.cpp
+@@ -33,6 +33,8 @@
+ 
+ // #include <sys/stat.h>
+ 
++#if !ENABLE_PCSL
++
+ extern "C" {
+ 
+ 
+@@ -176,3 +178,5 @@ int OsFile_remove(const char *filename) {
+ }
+ 
+ } // extern "C"
++
++#endif // !ENABLE_PCSL
+diff --git a/cldc/src/vm/os/generic/OsFile_generic.hpp b/cldc/src/vm/os/generic/OsFile_generic.hpp
+index 0c0e12d866ed107bbb89d455fad73cdb013e3b48..a9f29ca5f349fc3819ebf492b76d53c6a05a9818 100644
+--- a/cldc/src/vm/os/generic/OsFile_generic.hpp
++++ b/cldc/src/vm/os/generic/OsFile_generic.hpp
+@@ -30,10 +30,12 @@
+ 
+ extern "C" {
+ 
++#if !ENABLE_PCSL
+ struct OsFile;
+ typedef OsFile* OsFile_Handle;
++#endif
+ 
+-const char OsFile_separator_char      = '/';
++const char OsFile_separator_char      = '\\';
+ const char OsFile_path_separator_char = ';';
+ 
+ }
+diff --git a/midp/build/common/makefiles/Defs.gmk b/midp/build/common/makefiles/Defs.gmk
+index 337350c7f748f05d44471d3f97a5f029ba89ff33..b867c49fad79283b7eec86056e10d6ed8f82eab2 100644
+--- a/midp/build/common/makefiles/Defs.gmk
++++ b/midp/build/common/makefiles/Defs.gmk
+@@ -417,7 +417,7 @@ define compilefiles
+ 		else \
+ 			f2= ; \
+ 		fi ; \
+-		$(JAVAC_CMD) -g$(JAVAC_DEBUG) -d $(JAVAC_OUT_DIR) \
++		$(JAVAC_CMD) -source 1.3 -target 1.3 -g$(JAVAC_DEBUG) -d $(JAVAC_OUT_DIR) \
+ 			-bootclasspath $(BOOTCLASSPATH) \
+ 			-classpath $(CLASSBINDIR) $$f1 $$f2 || exit 1; \
+ 		if test "$(TARGET_VM)" = "cldc_vm"; then \
+diff --git a/midp/build/common/makefiles/gcc.gmk b/midp/build/common/makefiles/gcc.gmk
+index 93ffd84d702716ea62e1d78fb3b8f08133b712e0..5356fe10f2b772abde6254f25379ebc26aa65c73 100644
+--- a/midp/build/common/makefiles/gcc.gmk
++++ b/midp/build/common/makefiles/gcc.gmk
+@@ -99,7 +99,7 @@ LIBS		= -lpthread -lm -lnsl
+ # Options to force single-pass linker to search undefined references repeatly.
+ # Note. '-Wl,' option cannot be used instead of -Xlinker
+ LD_START_GROUP = -Xlinker --start-group
+-LD_END_GROUP = --end-group
++LD_END_GROUP = -Xlinker --end-group
+ 
+ AR		= $(GNU_TOOLS_BINDIR)ar
+ CREATE_LIB	= $(AR) -rcs
+diff --git a/midp/src/ams/ams_base/reference/native/midpInit.c b/midp/src/ams/ams_base/reference/native/midpInit.c
+index 4a19402796e06c4043e62ed3f092a83a76d7c5e3..e9da11c54f1910153976b61e542c0d1886554d8d 100644
+--- a/midp/src/ams/ams_base/reference/native/midpInit.c
++++ b/midp/src/ams/ams_base/reference/native/midpInit.c
+@@ -52,6 +52,10 @@ static char* midpHome = NULL;
+ 
+ static void (*vmFinalizer)(void) = NULL;
+ 
++/* Retained diagnostics for the freestanding 9588 launcher. */
++volatile int j2me_phoneme_midp_init_stage = 0;
++volatile int j2me_phoneme_midp_init_status = 0;
++
+ /**
+  * Sets the home directory for MIDP if needed.
+  * So the suites and other MIDP persistent
+@@ -139,6 +143,9 @@ int midpInitCallback(int level, int (*init)(void), void (*final)(void)) {
+     long totalSpace;
+     int result = -1; /* error status by default */
+ 
++    j2me_phoneme_midp_init_stage = 1;
++    j2me_phoneme_midp_init_status = 0;
++
+     if (initLevel >= level) {
+         return 0;
+     }
+@@ -154,9 +161,11 @@ int midpInitCallback(int level, int (*init)(void), void (*final)(void)) {
+         if (level >= MEM_LEVEL && initLevel < MEM_LEVEL) {
+             /* Do initialization for the next level: MEM_LEVEL */
+             if (midpInitializeMemory(-1) != 0) {
++                j2me_phoneme_midp_init_status = -101;
+                 break;
+             }
+             initLevel = MEM_LEVEL;
++            j2me_phoneme_midp_init_stage = 2;
+         }
+ 
+         if (level >= LIST_LEVEL && initLevel < LIST_LEVEL) {
+@@ -170,8 +179,12 @@ int midpInitCallback(int level, int (*init)(void), void (*final)(void)) {
+             sr_initSystem();
+ #endif
+             err = storageInitialize(midpHome);
++            j2me_phoneme_midp_init_stage = 3;
++            j2me_phoneme_midp_init_status = err;
+             if (err == 0) {
+                 status = midp_suite_storage_init();
++                j2me_phoneme_midp_init_stage = 4;
++                j2me_phoneme_midp_init_status = status;
+             } else {
+                 status = OUT_OF_MEMORY;
+             }
+@@ -181,8 +194,10 @@ int midpInitCallback(int level, int (*init)(void), void (*final)(void)) {
+             }
+ 
+             if (initializeConfig() != 0) {
++                j2me_phoneme_midp_init_status = -105;
+                 break;
+             }
++            j2me_phoneme_midp_init_stage = 5;
+ 
+             /*
+              * IMPL_NOTE: revisit for theme loading clean up
+@@ -221,6 +236,8 @@ int midpInitCallback(int level, int (*init)(void), void (*final)(void)) {
+         }
+ 
+         result = 0; /* OK status */
++        j2me_phoneme_midp_init_stage = 6;
++        j2me_phoneme_midp_init_status = 0;
+     } while (0);
+ 
+     if (result != 0) {
+diff --git a/midp/src/ams/example/ams_common/native/commandLineUtil.c b/midp/src/ams/example/ams_common/native/commandLineUtil.c
+index 7b752a23ef6a672aafeb0f09849f4ee8f326f752..327dd3ae82e502a0f9a967ff38fce380ebf00f1f 100644
+--- a/midp/src/ams/example/ams_common/native/commandLineUtil.c
++++ b/midp/src/ams/example/ams_common/native/commandLineUtil.c
+@@ -27,7 +27,6 @@
+ #include <string.h>
+ #include <stdio.h>
+ #include <stdlib.h>
+-#include <sys/stat.h>
+ #include <ctype.h>
+ #include <midpStorage.h>
+ 
+diff --git a/midp/src/ams/example/ams_common_port/lib.gmk b/midp/src/ams/example/ams_common_port/lib.gmk
+index fd1fd8780860b520117012f03441f25be3eb50e9..7a9e184ef9a250dc150bac498d2be61b37655ba6 100644
+--- a/midp/src/ams/example/ams_common_port/lib.gmk
++++ b/midp/src/ams/example/ams_common_port/lib.gmk
+@@ -35,6 +35,9 @@
+ # vpath for ( ams_common_port ) module
+ #
+ 
++ifeq ($(TARGET_CPU), mips)
++    vpath % $(BBK9588_PORT_DIR)
++else
+ ifeq ($(TARGET_PLATFORM), javacall)
+     vpath % $(SUBSYSTEM_AMS_DIR)/example/ams_common_port/$(TARGET_PLATFORM)/native
+ else
+@@ -44,6 +47,7 @@ else
+     vpath % $(SUBSYSTEM_AMS_DIR)/example/ams_common_port/default/native
+ endif
+ endif
++endif
+ 
+ SUBSYSTEM_AMS_EXTRA_INCLUDES += \
+     -I$(SUBSYSTEM_AMS_DIR)/example/ams_common/include \
+@@ -52,6 +56,11 @@ SUBSYSTEM_AMS_EXTRA_INCLUDES += \
+ # Native files for the ( ams_common_port ) module
+ #
+ ifeq ($(TARGET_VM), cldc_vm)
++ifeq ($(TARGET_CPU), mips)
++SUBSYSTEM_AMS_NATIVE_FILES += \
++    phoneme_commandline_port.c
++else
+ SUBSYSTEM_AMS_NATIVE_FILES += \
+     commandLineUtil_md.c
+ endif
++endif
+diff --git a/midp/src/ams/example/jams/native/runMidlet.c b/midp/src/ams/example/jams/native/runMidlet.c
+index d885c6dbc19bcbcae7ebc8fa9d1628d6d8f41d5a..f631020f57c6772b99900631caf2012cbd59d22c 100644
+--- a/midp/src/ams/example/jams/native/runMidlet.c
++++ b/midp/src/ams/example/jams/native/runMidlet.c
+@@ -36,16 +36,115 @@
+ #include <suitestore_task_manager.h>
+ #include <commandLineUtil.h>
+ #include <commandLineUtil_md.h>
++#include <midpJar.h>
+ 
+ #if ENABLE_MULTIPLE_ISOLATES
+ #define MIDP_HEAP_REQUIREMENT (MAX_ISOLATES * 1024 * 1024)
+ #else
+-#define MIDP_HEAP_REQUIREMENT (1280 * 1024)
++#define MIDP_HEAP_REQUIREMENT (3 * 1024 * 1024)
+ #endif
+ 
+ /** Maximum number of command line arguments. */
+ #define RUNMIDLET_MAX_ARGS 32
+ 
++volatile int j2me_phoneme_run_stage = 0;
++volatile int j2me_phoneme_run_status = 0;
++
++/*
++ * The stock development launcher only discovers a MIDlet class for an
++ * installed suite.  The 9588 launcher deliberately runs the selected JAR
++ * directly, so obtain MIDlet-1 from its manifest without installing/copying
++ * the game first.  This also keeps startup time and storage use down.
++ */
++static int
++classFromExternalJar(const char* jarPath, pcsl_string* className) {
++    static const char manifestName[] = "META-INF/MANIFEST.MF";
++    pcsl_string jar = PCSL_STRING_NULL;
++    pcsl_string manifest = PCSL_STRING_NULL;
++    unsigned char* data = NULL;
++    void* handle = NULL;
++    long size;
++    int error = 0;
++    int result = 0;
++
++    if (PCSL_STRING_OK != pcsl_string_from_chars(jarPath, &jar) ||
++            PCSL_STRING_OK != pcsl_string_from_chars(manifestName,
++                &manifest)) {
++        goto cleanup;
++    }
++
++    handle = midpOpenJar(&error, &jar);
++    if (handle == NULL || error != 0) {
++        goto cleanup;
++    }
++    size = midpGetJarEntry(handle, &manifest, &data);
++    if (size > 0 && data != NULL) {
++        long at = 0;
++        while (at < size) {
++            long lineStart = at;
++            long lineEnd;
++            long comma = -1;
++            long valueEnd;
++            char buffer[256];
++            int length;
++
++            while (at < size && data[at] != '\r' && data[at] != '\n') {
++                ++at;
++            }
++            lineEnd = at;
++            while (at < size && (data[at] == '\r' || data[at] == '\n')) {
++                ++at;
++            }
++            if (lineEnd - lineStart < 9 ||
++                    memcmp(data + lineStart, "MIDlet-1:", 9) != 0) {
++                continue;
++            }
++            while (lineStart < lineEnd) {
++                if (data[lineStart] == ',') {
++                    comma = lineStart;
++                }
++                ++lineStart;
++            }
++            if (comma < 0) {
++                break;
++            }
++            ++comma;
++            while (comma < lineEnd &&
++                    (data[comma] == ' ' || data[comma] == '\t')) {
++                ++comma;
++            }
++            valueEnd = lineEnd;
++            while (valueEnd > comma &&
++                    (data[valueEnd - 1] == ' ' ||
++                     data[valueEnd - 1] == '\t')) {
++                --valueEnd;
++            }
++            length = (int)(valueEnd - comma);
++            if (length <= 0 || length >= (int)sizeof(buffer)) {
++                break;
++            }
++            memcpy(buffer, data + comma, (size_t)length);
++            buffer[length] = '\0';
++            if (PCSL_STRING_OK == pcsl_string_from_chars(buffer,
++                    className)) {
++                result = 1;
++            }
++            break;
++        }
++    }
++
++cleanup:
++    if (data != NULL) {
++        midpFree(data);
++    }
++    if (handle != NULL) {
++        midpCloseJar(handle);
++    }
++    pcsl_string_free(&manifest);
++    pcsl_string_free(&jar);
++    return result;
++}
++
+ /** Usage text for the run MIDlet executable. */
+ static const char* const runUsageText =
+ "\n"
+@@ -97,6 +196,9 @@ runMidlet(int argc, char** commandlineArgs) {
+     int ordinalSuiteNumber = -1;
+     char* chSuiteNum = NULL;
+ 
++    j2me_phoneme_run_stage = 1;
++    j2me_phoneme_run_status = 0;
++
+     JVM_Initialize(); /* It's OK to call this more than once */
+ 
+     /*
+@@ -185,10 +287,12 @@ runMidlet(int argc, char** commandlineArgs) {
+     midpSetHomeDir(midpHome);
+ 
+     if (midpInitialize() != 0) {
++        j2me_phoneme_run_stage = -10;
+         REPORT_ERROR(LC_AMS, "Not enough memory");
+         fprintf(stderr, "Not enough memory\n");
+         return -1;
+     }
++    j2me_phoneme_run_stage = 10;
+ 
+     do {
+         int onlyDigits;
+@@ -227,6 +331,7 @@ runMidlet(int argc, char** commandlineArgs) {
+             }
+ 
+         }
++        j2me_phoneme_run_stage = 20;
+ 
+         /* if the storage name only digits, convert it */
+         onlyDigits = 1;
+@@ -299,6 +404,10 @@ runMidlet(int argc, char** commandlineArgs) {
+             }
+         }
+ 
++        if (pcsl_string_is_null(&classname) && additionalPath != NULL) {
++            (void)classFromExternalJar(additionalPath, &classname);
++        }
++
+         if (pcsl_string_is_null(&classname)) {
+             int res = find_midlet_class(suiteId, 1, &classname);
+             if (OUT_OF_MEM_LEN == res) {
+@@ -315,9 +424,12 @@ runMidlet(int argc, char** commandlineArgs) {
+         }
+ 
+         do {
++            j2me_phoneme_run_stage = 30;
+             status = midp_run_midlet_with_args_cp(suiteId, &classname,
+                                                   &arg0, &arg1, &arg2,
+                                                   debugOption, additionalPath);
++            j2me_phoneme_run_stage = 31;
++            j2me_phoneme_run_status = status;
+         } while (repeatMidlet && status != MIDP_SHUTDOWN_STATUS);
+ 
+         if (pSuites != NULL) {
+diff --git a/midp/src/configuration/properties_port/static/native/midp_properties_static.c b/midp/src/configuration/properties_port/static/native/midp_properties_static.c
+index 700d9899691b034843c947eed6fe919ec4039581..5fd9b98b5afb9060d014e33c87bbd6794ee26e99 100644
+--- a/midp/src/configuration/properties_port/static/native/midp_properties_static.c
++++ b/midp/src/configuration/properties_port/static/native/midp_properties_static.c
+@@ -35,6 +35,7 @@
+ #include <midp_properties_port.h>
+ 
+ /* generated by Configurator */
++/* Generated by the configurator; keep this include visible to dependency tools. */
+ #include <midp_properties_static_data.h>
+ 
+ /**
+diff --git a/midp/src/core/native_thread/lib.gmk b/midp/src/core/native_thread/lib.gmk
+index efea70abfa266fc3fe8325ce23d6c2e9b8f6502e..c298bbfbeb2b119e2719a7e839a471136a2cb6ab 100644
+--- a/midp/src/core/native_thread/lib.gmk
++++ b/midp/src/core/native_thread/lib.gmk
+@@ -44,6 +44,9 @@ SUBSYSTEM_NATIVETHREAD_EXTRA_INCLUDES += \
+ ifeq ($(TARGET_VM), cldc_vm)
+ # Platform definitions
+ #
++ifeq ($(TARGET_CPU), mips)
++   include $(NATIVE_THREAD_DIR)/stubs/lib.gmk
++else
+ ifeq ($(PLATFORM), stubs)
+    include $(NATIVE_THREAD_DIR)/$(PLATFORM)/lib.gmk
+ else
+@@ -61,6 +64,7 @@ else
+       endif
+    endif
+ endif
++endif
+ else
+    include $(NATIVE_THREAD_DIR)/stubs/lib.gmk
+ endif
+diff --git a/midp/src/core/storage/reference/native/midpStorage.c b/midp/src/core/storage/reference/native/midpStorage.c
+index 33a02d1e541e1320995d13b41f5bacb87f3f775d..ec81d33c6d5482beb13ce82c384a7179086b911c 100644
+--- a/midp/src/core/storage/reference/native/midpStorage.c
++++ b/midp/src/core/storage/reference/native/midpStorage.c
+@@ -122,6 +122,8 @@ static pcsl_string configRoot[MAX_STORAGE_NUM] = {
+ };
+ static int storageInitDone = 0;
+ 
++volatile int j2me_phoneme_storage_init_stage = 0;
++
+ #define MAX_ERROR_LEN 159
+ static char errorBuffer[MAX_ERROR_LEN + 1] = {0};
+ 
+@@ -136,23 +138,28 @@ int
+ storageInitialize(char *midp_home) {
+     jchar fsep = storageGetFileSeparator();
+ 
++    j2me_phoneme_storage_init_stage = 1;
++
+     if (storageInitDone) {
+         /* Already initialized */
+         return 0;
+     }
+ 
+     if (PCSL_STRING_OK != pcsl_string_initialize()) {
++        j2me_phoneme_storage_init_stage = -1;
+         REPORT_ERROR(LC_CORE, "Error: cannot initialize string library.\n");
+         return -1;
+     }
+ 
+     if(pcsl_file_init() < 0)  {
++        j2me_phoneme_storage_init_stage = -2;
+         REPORT_ERROR(LC_CORE, "Error: out of memory.\n");
+         return -1;
+     }
+ 
+     /* set up a path to the internal storage */
+     if (PCSL_STRING_OK != pcsl_string_from_chars(midp_home, &sRoot[0])) {
++        j2me_phoneme_storage_init_stage = -3;
+         REPORT_ERROR(LC_CORE, "Error: out of memory.\n");
+         storageFinalize();
+         return -1;
+@@ -164,17 +171,20 @@ storageInitialize(char *midp_home) {
+     if (PCSL_STRING_OK != pcsl_string_append_char(&sRoot[0], fsep)
+      || PCSL_STRING_OK != pcsl_string_append(&sRoot[0], &APP_DIR)
+      || PCSL_STRING_OK != pcsl_string_append_char(&sRoot[0], fsep)) {
++        j2me_phoneme_storage_init_stage = -4;
+         REPORT_ERROR(LC_CORE, "Error: out of memory.\n");
+         storageFinalize();
+         return -1;
+     }
+ 
+     if (0 != initializeConfigRoot(midp_home)) {
++        j2me_phoneme_storage_init_stage = -5;
+         storageFinalize();
+         return -1;
+     }
+ 
+     storageInitDone = 1;
++    j2me_phoneme_storage_init_stage = 6;
+     return 0;
+ }
+ 
+@@ -882,4 +892,3 @@ storage_write_utf16_string(char** ppszError, int handle, const pcsl_string* str)
+     }
+   }
+ }
+-
+diff --git a/midp/src/core/timezone/lib.gmk b/midp/src/core/timezone/lib.gmk
+index 993da4562f09558e5378ee4d0782b87d04f5e019..8007deb12b710a6e4e9eb6f5b3a0a49994213802 100644
+--- a/midp/src/core/timezone/lib.gmk
++++ b/midp/src/core/timezone/lib.gmk
+@@ -43,6 +43,9 @@ SUBSYSTEM_TIMEZONE_EXTRA_INCLUDES += \
+ 
+ # Platform definitions
+ #
++ifeq ($(TARGET_CPU), mips)
++    include $(TIMEZONE_DIR)/stubs/lib.gmk
++else
+ ifeq ($(PLATFORM), stubs)
+     include $(TIMEZONE_DIR)/stubs/lib.gmk
+ else
+@@ -56,4 +59,4 @@ else
+         endif
+     endif
+ endif
+-
++endif
+diff --git a/midp/src/events/input_port/bbk9588/lib.gmk b/midp/src/events/input_port/bbk9588/lib.gmk
+new file mode 100644
+index 0000000000000000000000000000000000000000..18d9608fa6475849f5adb7e2d2ee2884481c5120
+--- /dev/null
++++ b/midp/src/events/input_port/bbk9588/lib.gmk
+@@ -0,0 +1,8 @@
++ifndef BBK9588_PORT_DIR
++$(error BBK9588_PORT_DIR must point at src/platform/bbk9588)
++endif
++
++vpath % $(BBK9588_PORT_DIR)
++
++SUBSYSTEM_APP_NATIVE_FILES += \
++    phoneme_input_port.c
+diff --git a/midp/src/events/input_port/lib.gmk b/midp/src/events/input_port/lib.gmk
+index e24fd4c06ec882767af4ae20e648d8507440c100..c5e876aaf5a170edf0f1b1d165dd46068bdedcc9 100644
+--- a/midp/src/events/input_port/lib.gmk
++++ b/midp/src/events/input_port/lib.gmk
+@@ -43,6 +43,9 @@ SUBSYSTEM_EVENTS_EXTRA_INCLUDES += \
+ 
+ # Select implementation
+ #
++ifeq ($(TARGET_CPU), mips)
++    include $(INPUT_PORT_DIR)/bbk9588/lib.gmk
++else
+ ifeq ($(TARGET_CPU), arm)
+     include $(INPUT_PORT_DIR)/fb/lib.gmk
+ else
+@@ -51,4 +54,5 @@ ifeq ($(USE_DIRECTFB), true)
+ else      
+     include $(INPUT_PORT_DIR)/qvfb/lib.gmk
+ endif
+-endif
+\ No newline at end of file
++endif
++endif
+diff --git a/midp/src/events/mastermode_port/bbk9588/lib.gmk b/midp/src/events/mastermode_port/bbk9588/lib.gmk
+new file mode 100644
+index 0000000000000000000000000000000000000000..98250949097fa1a6ab8c634e899718ca0f30f642
+--- /dev/null
++++ b/midp/src/events/mastermode_port/bbk9588/lib.gmk
+@@ -0,0 +1,11 @@
++ifndef BBK9588_PORT_DIR
++$(error BBK9588_PORT_DIR must point at src/platform/bbk9588)
++endif
++
++vpath % $(BBK9588_PORT_DIR)
++
++SUBSYSTEM_EVENTS_EXTRA_INCLUDES += \
++    -I$(BBK9588_PORT_DIR)/../..
++
++SUBSYSTEM_EVENTS_NATIVE_FILES += \
++    phoneme_mastermode_port.c
+diff --git a/midp/src/events/mastermode_port/lib.gmk b/midp/src/events/mastermode_port/lib.gmk
+index a00e7a9a725a2952ef14ac6a5aa54a1b6a6b5ba1..8cdc3bd699eba1523b5a7fe75e83a1cbc204af64 100644
+--- a/midp/src/events/mastermode_port/lib.gmk
++++ b/midp/src/events/mastermode_port/lib.gmk
+@@ -40,4 +40,8 @@ SUBSYSTEM_EVENTS_EXTRA_INCLUDES += \
+ 
+ # Platform
+ #
++ifeq ($(TARGET_CPU), mips)
++include $(SUBSYSTEM_EVENTS_DIR)/mastermode_port/bbk9588/lib.gmk
++else
+ include $(SUBSYSTEM_EVENTS_DIR)/mastermode_port/$(PLATFORM)/lib.gmk
++endif
+diff --git a/midp/src/highlevelui/fb_application/reference/native/fbapp_export.c b/midp/src/highlevelui/fb_application/reference/native/fbapp_export.c
+index 0fc94a4a8a01d3104cb77922522c79e3c75dd473..cab9354321d10cb3e3e0a49c17f9d449fe69da06 100644
+--- a/midp/src/highlevelui/fb_application/reference/native/fbapp_export.c
++++ b/midp/src/highlevelui/fb_application/reference/native/fbapp_export.c
+@@ -24,10 +24,12 @@
+  * information or have any questions.
+  */
+ 
++#if !defined(MIPS)
+ #include <sys/stat.h>
+ #include <sys/types.h>
+ #include <fcntl.h>
+ #include <unistd.h>
++#endif
+ #include <string.h>
+ #include <stdio.h>
+ 
+@@ -62,6 +64,9 @@ static LinuxFbDeviceType linuxFbDeviceType;
+ 
+ /** Detect frame buffer device type of the host Linux system */
+ static void checkDeviceType() {
++#if defined(MIPS)
++    linuxFbDeviceType = LINUX_FB_VERSATILE_INTEGRATOR;
++#else
+     char buff[1000];
+     int fd;
+     linuxFbDeviceType = LINUX_FB_VERSATILE_INTEGRATOR; /* default */
+@@ -87,6 +92,7 @@ static void checkDeviceType() {
+         }
+         close(fd);
+     }
++#endif
+ }
+ 
+ /**
+diff --git a/midp/src/highlevelui/fb_port/bbk9588/lib.gmk b/midp/src/highlevelui/fb_port/bbk9588/lib.gmk
+new file mode 100644
+index 0000000000000000000000000000000000000000..1a1642e6b60d2555370b791319516f6baa1edbe8
+--- /dev/null
++++ b/midp/src/highlevelui/fb_port/bbk9588/lib.gmk
+@@ -0,0 +1,12 @@
++ifndef BBK9588_PORT_DIR
++$(error BBK9588_PORT_DIR must point at src/platform/bbk9588)
++endif
++
++vpath % $(BBK9588_PORT_DIR)
++
++SUBSYSTEM_APP_EXTRA_INCLUDES += \
++    -I$(BBK9588_PORT_DIR)/../..
++
++SUBSYSTEM_APP_NATIVE_FILES += \
++    phoneme_bbk9588_port.c \
++    native_events.c
+diff --git a/midp/src/highlevelui/fb_port/lib.gmk b/midp/src/highlevelui/fb_port/lib.gmk
+index 758c5a75455fdee5250335ad3bd464ee3a12b762..424e70c7dcf4a41131decd8e29038ddf3ec53dbe 100644
+--- a/midp/src/highlevelui/fb_port/lib.gmk
++++ b/midp/src/highlevelui/fb_port/lib.gmk
+@@ -54,9 +54,13 @@ SUBSYSTEM_APP_JAVA_FILES +=
+ ifeq ($(USE_DIRECTFB), true)
+     include $(FBPORT_DIR)/directfb/lib.gmk
+ else 
++ifeq ($(TARGET_CPU), mips)
++    include $(FBPORT_DIR)/bbk9588/lib.gmk
++else
+ ifeq ($(TARGET_CPU), arm)
+     include $(FBPORT_DIR)/fb/lib.gmk
+ else
+     include $(FBPORT_DIR)/qvfb/lib.gmk
+ endif
+ endif
++endif
+diff --git a/midp/src/highlevelui/lcdui/reference/classes/javax/microedition/lcdui/Display.jpp b/midp/src/highlevelui/lcdui/reference/classes/javax/microedition/lcdui/Display.jpp
+index 5cfb2e7c857721e16df08c75a9689e4cfe09adb8..c518ea06dcb2b9aa10ffc3807b2de78252180056 100644
+--- a/midp/src/highlevelui/lcdui/reference/classes/javax/microedition/lcdui/Display.jpp
++++ b/midp/src/highlevelui/lcdui/reference/classes/javax/microedition/lcdui/Display.jpp
+@@ -2159,9 +2159,16 @@ public class Display {
+         // SYNC NOTE: calls to isShown() should be synchronized on
+         // the LCDUILock.
+ 
+-        return hasForeground
+-            && !paintSuspended
+-            && (current == d);
++        /*
++         * BBK9588 runs one embedded MIDlet and does not have a Java AMS to
++         * deliver the normal foreground transition.  The native framebuffer
++         * is already owned by this Display, so the AMS-controlled
++         * hasForeground and paintSuspended flags never make their normal
++         * transition. Requiring either flag here leaves Canvas.isShown()
++         * false forever and stalls games that wait for their splash Canvas to
++         * become visible.
++         */
++        return current == d;
+     }
+ 
+     /**
+diff --git a/midp/src/highlevelui/lcdui/reference/classes/javax/microedition/lcdui/Displayable.java b/midp/src/highlevelui/lcdui/reference/classes/javax/microedition/lcdui/Displayable.java
+index 5a1c248e17ddcf8bd3b31d9b415fb20c92c24c5a..ae90abcaca0e1cbca2a0cdb53429660fcd7e0799 100644
+--- a/midp/src/highlevelui/lcdui/reference/classes/javax/microedition/lcdui/Displayable.java
++++ b/midp/src/highlevelui/lcdui/reference/classes/javax/microedition/lcdui/Displayable.java
+@@ -496,4 +496,3 @@ public abstract class Displayable {
+ // ************************************************************
+ 
+ } // Displayable
+-
+diff --git a/midp/src/media/lib.gmk b/midp/src/media/lib.gmk
+index 8a01443e12b22c83cd62f8482e24f4cd69c39361..b9dd90e3793154a94048015170d9bd191c523bb8 100644
+--- a/midp/src/media/lib.gmk
++++ b/midp/src/media/lib.gmk
+@@ -65,6 +65,7 @@ SUBSYSTEM_MEDIA_JAVA_FILES += \
+      $(SUBSYSTEM_DIR)/media/reference/classes/javax/microedition/media/Control.java \
+      $(SUBSYSTEM_DIR)/media/reference/classes/javax/microedition/media/Controllable.java \
+      $(SUBSYSTEM_DIR)/media/reference/classes/javax/microedition/media/Manager.java \
++     $(SUBSYSTEM_DIR)/media/reference/classes/javax/microedition/media/BBK9588Player.java \
+      $(SUBSYSTEM_DIR)/media/reference/classes/javax/microedition/media/MediaException.java \
+      $(SUBSYSTEM_DIR)/media/reference/classes/javax/microedition/media/Player.java \
+      $(SUBSYSTEM_DIR)/media/reference/classes/javax/microedition/media/PlayerListener.java \
+@@ -80,4 +81,3 @@ SUBSYSTEM_MEDIA_JAVA_FILES += \
+ ############################################################
+ ##  no native sources for media, therefore empty
+ 
+-
+diff --git a/midp/src/media/reference/classes/javax/microedition/media/BBK9588Player.java b/midp/src/media/reference/classes/javax/microedition/media/BBK9588Player.java
+new file mode 100644
+index 0000000000000000000000000000000000000000..5f5d616e643852e658e7be32c630d307df61191a
+--- /dev/null
++++ b/midp/src/media/reference/classes/javax/microedition/media/BBK9588Player.java
+@@ -0,0 +1,241 @@
++/*
++ * Copyright 2026 J2ME-for9588 contributors.
++ *
++ * This file is distributed under the same GPLv2 terms as phoneME Feature.
++ */
++package javax.microedition.media;
++
++import java.util.Vector;
++import javax.microedition.media.control.VolumeControl;
++
++/** Small single-device MMAPI player backed by the BBK9588 raw PCM port. */
++final class BBK9588Player implements Player, VolumeControl {
++    static final int KIND_MIDI = 1;
++    static final int KIND_WAV = 2;
++    static final int MAX_MEDIA_BYTES = 512 * 1024;
++
++    private final byte[] data;
++    private final String contentType;
++    private final int kind;
++    private final Vector listeners = new Vector(1);
++    private int state = UNREALIZED;
++    private int loopCount = 1;
++    private int level = 100;
++    private boolean muted;
++    private long mediaTime;
++
++    BBK9588Player(byte[] data, String contentType, int kind) {
++        this.data = data;
++        this.contentType = contentType;
++        this.kind = kind;
++    }
++
++    static int kindFor(String contentType) {
++        if (contentType == null) {
++            return 0;
++        }
++        String type = contentType.toLowerCase();
++        if ("audio/midi".equals(type) || "audio/mid".equals(type) ||
++                "audio/x-midi".equals(type) || "audio/sp-midi".equals(type)) {
++            return KIND_MIDI;
++        }
++        if ("audio/wav".equals(type) || "audio/wave".equals(type) ||
++                "audio/x-wav".equals(type) || "audio/x-pn-wav".equals(type)) {
++            return KIND_WAV;
++        }
++        return 0;
++    }
++
++    public synchronized void realize() throws MediaException {
++        checkOpen();
++        if (state == UNREALIZED) {
++            state = REALIZED;
++        }
++    }
++
++    public synchronized void prefetch() throws MediaException {
++        realize();
++        if (state < PREFETCHED) {
++            state = PREFETCHED;
++        }
++    }
++
++    public synchronized void start() throws MediaException {
++        prefetch();
++        if (state == STARTED) {
++            return;
++        }
++        if (!nativeStart(data, kind, loopCount, muted ? 0 : level)) {
++            throw new MediaException("Unsupported or invalid audio data");
++        }
++        state = STARTED;
++        mediaTime = 0;
++        notifyListeners(PlayerListener.STARTED, null);
++    }
++
++    public synchronized void stop() throws MediaException {
++        checkOpen();
++        if (state == STARTED) {
++            mediaTime = nativeMediaTime();
++            nativeStop();
++            state = PREFETCHED;
++            notifyListeners(PlayerListener.STOPPED, null);
++        }
++    }
++
++    public synchronized void deallocate() {
++        if (state == CLOSED || state == UNREALIZED) {
++            return;
++        }
++        if (state == STARTED) {
++            mediaTime = nativeMediaTime();
++            nativeStop();
++        }
++        state = REALIZED;
++    }
++
++    public synchronized void close() {
++        if (state == CLOSED) {
++            return;
++        }
++        if (state == STARTED) {
++            nativeStop();
++        }
++        state = CLOSED;
++        notifyListeners(PlayerListener.CLOSED, null);
++        listeners.removeAllElements();
++    }
++
++    public synchronized long setMediaTime(long now) throws MediaException {
++        checkOpen();
++        if (now < 0) {
++            now = 0;
++        }
++        if (state == STARTED) {
++            nativeStop();
++            state = PREFETCHED;
++        }
++        mediaTime = now == 0 ? 0 : now;
++        return mediaTime;
++    }
++
++    public synchronized long getMediaTime() {
++        if (state == STARTED) {
++            mediaTime = nativeMediaTime();
++        }
++        return mediaTime;
++    }
++
++    public synchronized int getState() {
++        if (state == STARTED && !nativeIsPlaying()) {
++            mediaTime = nativeMediaTime();
++            state = PREFETCHED;
++            notifyListeners(PlayerListener.END_OF_MEDIA, null);
++        }
++        return state;
++    }
++
++    public long getDuration() {
++        return TIME_UNKNOWN;
++    }
++
++    public String getContentType() {
++        return contentType;
++    }
++
++    public synchronized void setLoopCount(int count) {
++        checkOpen();
++        if (count == 0 || count < -1) {
++            throw new IllegalArgumentException("bad loop count");
++        }
++        if (state == STARTED) {
++            throw new IllegalStateException("already started");
++        }
++        loopCount = count;
++    }
++
++    public synchronized void addPlayerListener(PlayerListener listener) {
++        checkOpen();
++        if (listener != null && !listeners.contains(listener)) {
++            listeners.addElement(listener);
++        }
++    }
++
++    public synchronized void removePlayerListener(PlayerListener listener) {
++        checkOpen();
++        listeners.removeElement(listener);
++    }
++
++    public Control[] getControls() {
++        checkOpen();
++        return new Control[] { this };
++    }
++
++    public Control getControl(String controlType) {
++        checkOpen();
++        if (controlType == null) {
++            throw new IllegalArgumentException("null control");
++        }
++        if ("VolumeControl".equals(controlType) ||
++                "javax.microedition.media.control.VolumeControl".equals(controlType)) {
++            return this;
++        }
++        return null;
++    }
++
++    public synchronized void setMute(boolean mute) {
++        checkOpen();
++        if (muted != mute) {
++            muted = mute;
++            if (state == STARTED) {
++                nativeSetVolume(muted ? 0 : level);
++            }
++            notifyListeners(PlayerListener.VOLUME_CHANGED, this);
++        }
++    }
++
++    public boolean isMuted() {
++        return muted;
++    }
++
++    public synchronized int setLevel(int newLevel) {
++        checkOpen();
++        if (newLevel < 0) {
++            newLevel = 0;
++        } else if (newLevel > 100) {
++            newLevel = 100;
++        }
++        if (level != newLevel) {
++            level = newLevel;
++            if (state == STARTED && !muted) {
++                nativeSetVolume(level);
++            }
++            notifyListeners(PlayerListener.VOLUME_CHANGED, this);
++        }
++        return level;
++    }
++
++    public int getLevel() {
++        return level;
++    }
++
++    private void checkOpen() {
++        if (state == CLOSED) {
++            throw new IllegalStateException("player is closed");
++        }
++    }
++
++    private void notifyListeners(String event, Object data) {
++        for (int i = 0; i < listeners.size(); i++) {
++            ((PlayerListener)listeners.elementAt(i)).playerUpdate(this, event, data);
++        }
++    }
++
++    static native void playTone(int note, int duration, int volume);
++    private static native boolean nativeStart(byte[] data, int kind,
++        int loops, int volume);
++    private static native void nativeStop();
++    private static native void nativeSetVolume(int volume);
++    private static native boolean nativeIsPlaying();
++    private static native long nativeMediaTime();
++}
+diff --git a/midp/src/media/reference/classes/javax/microedition/media/Manager.java b/midp/src/media/reference/classes/javax/microedition/media/Manager.java
+index a18bbe47c51fb6a11e2fb5a279be23a565ede12f..cca0f61c8214536c8c808d02ee2c0c1d7565a571 100644
+--- a/midp/src/media/reference/classes/javax/microedition/media/Manager.java
++++ b/midp/src/media/reference/classes/javax/microedition/media/Manager.java
+@@ -28,6 +28,7 @@ package javax.microedition.media;
+ 
+ import java.io.InputStream;
+ import java.io.IOException;
++import java.io.ByteArrayOutputStream;
+ 
+ 
+ 
+@@ -516,7 +517,11 @@ public final class Manager {
+      * @return           The list of supported content types for the given protocol.
+      */
+     public static String[] getSupportedContentTypes(String protocol) {
+-        return new String[0];        
++        if (protocol == null || "file".equals(protocol) ||
++                "http".equals(protocol)) {
++            return new String[] { "audio/midi", "audio/x-wav" };
++        }
++        return new String[0];
+     }
+ 
+ 
+@@ -548,6 +553,9 @@ public final class Manager {
+      * @return               The list of supported protocols for the given content type.
+      */
+     public static String[] getSupportedProtocols(String content_type) {
++        if (content_type == null || BBK9588Player.kindFor(content_type) != 0) {
++            return new String[] { "file", "http" };
++        }
+         return new String[0];
+     }
+ 
+@@ -605,7 +613,29 @@ public final class Manager {
+             throw new MediaException(PL_ERR + "NULL content-type");
+         }
+         
+-        throw new MediaException("Cannot create Player");
++        int kind = BBK9588Player.kindFor(type);
++        if (kind == 0) {
++            throw new MediaException(PL_ERR + type);
++        }
++
++        ByteArrayOutputStream output = new ByteArrayOutputStream(4096);
++        byte[] block = new byte[1024];
++        int total = 0;
++        for (;;) {
++            int count = stream.read(block, 0, block.length);
++            if (count < 0) {
++                break;
++            }
++            if (count == 0) {
++                continue;
++            }
++            total += count;
++            if (total > BBK9588Player.MAX_MEDIA_BYTES) {
++                throw new MediaException("Audio resource is too large");
++            }
++            output.write(block, 0, count);
++        }
++        return new BBK9588Player(output.toByteArray(), type, kind);
+ 
+     }
+ 
+@@ -638,9 +668,16 @@ public final class Manager {
+      */
+     public static void playTone(int note, int duration, int volume)
+          throws MediaException {
+-        
+         if (note < 0 || note > 127 || duration <= 0) {
+             throw new IllegalArgumentException("bad param");
+         }
++        if (volume < 0) {
++            volume = 0;
++        } else if (volume > 100) {
++            volume = 100;
++        }
++        if (volume != 0) {
++            BBK9588Player.playTone(note, duration, volume);
++        }
+     }
+ }
+diff --git a/midp/src/protocol/serial/lib.gmk b/midp/src/protocol/serial/lib.gmk
+index 5d07db627dfe957fd5c51c146c8eb169ebef4b88..728f758f032aae8bdba0e1c301df31bff85679d9 100644
+--- a/midp/src/protocol/serial/lib.gmk
++++ b/midp/src/protocol/serial/lib.gmk
+@@ -34,6 +34,9 @@
+ #
+ ######################################################################
+ 
++# The BBK9588 target has no serial device and omits this optional protocol.
++ifneq ($(TARGET_CPU),mips)
++
+ #IMPL_NOTE - build subsystem on linux and javacall only
+ ifneq ($(findstring $(TARGET_OS),linux javacall),)
+ 
+@@ -82,4 +85,6 @@ not_yet_implemented:: serial_not_yet_implemented
+ 
+ serial_not_yet_implemented:
+ 	@echo "Serial communication is not implemented yet for OS $(TARGET_OS)"
+-endif
+\ No newline at end of file
++endif
++
++endif
+diff --git a/midp/src/protocol/serial_port/lib.gmk b/midp/src/protocol/serial_port/lib.gmk
+index b73c3e6dede9759245ee8e3abc1dc810fff51640..caaf7d13ab62d0d978397ae27dbbbfaa970d9b69 100644
+--- a/midp/src/protocol/serial_port/lib.gmk
++++ b/midp/src/protocol/serial_port/lib.gmk
+@@ -34,6 +34,9 @@
+ #
+ ######################################################################
+ 
++# The BBK9588 target has no serial device and omits this optional port.
++ifneq ($(TARGET_CPU),mips)
++
+ # Adds to global SUBSYSTEMS list
+ #
+ SUBSYSTEMS += serial_port
+@@ -54,3 +57,5 @@ not_yet_implemented:: serial_port_not_yet_implemented
+ serial_port_not_yet_implemented:
+ 	@echo "Serial port communication is not implemented yet for OS $(TARGET_OS)"
+ endif
++
++endif
+diff --git a/midp/src/protocol/serial_port/stubs/lib.gmk b/midp/src/protocol/serial_port/stubs/lib.gmk
+index 99aab5b7f9359d38ee9bb9df3656981a1a6bbf47..34d50ebdca311cf8ace861a6618a4f9809ce11a9 100644
+--- a/midp/src/protocol/serial_port/stubs/lib.gmk
++++ b/midp/src/protocol/serial_port/stubs/lib.gmk
+@@ -31,7 +31,7 @@
+ 
+ # vpath for ( serial_port ) subsystem
+ #
+-vpath % $(SUBSYSTEM_DIR)/serial_port/stubs/native
++vpath % $(SUBSYSTEM_DIR)/protocol/serial_port/stubs/native
+ 
+ # Native files for the ( protocol ) module
+ #
+diff --git a/pcsl/file/bbk9588/GNUmakefile b/pcsl/file/bbk9588/GNUmakefile
+new file mode 100644
+index 0000000000000000000000000000000000000000..cf69f263e067bc950d1f9305b77200606b679c73
+--- /dev/null
++++ b/pcsl/file/bbk9588/GNUmakefile
+@@ -0,0 +1,37 @@
++# phoneME PCSL file adapter for the freestanding BBK9588 BDA target.
++PCSL_DIR = $(CURDIR)/../../
++FILE_MODULE = bbk9588
++
++ifdef PCSL_PLATFORM
++include $(PCSL_DIR)/makefiles/top.gmk
++endif
++
++ifndef BBK9588_PORT_DIR
++$(error BBK9588_PORT_DIR must point at src/platform/bbk9588)
++endif
++
++LIBNAME = $(OUTPUT_LIB_DIR)/libpcsl_file$(LIB_EXT)
++OBJS = $(OUTPUT_OBJ_DIR)/phoneme_pcsl_file.o
++
++all: verify $(OUTPUT_OBJ_DIR) $(OUTPUT_LIB_DIR) $(OUTPUT_INC_DIR) $(LIBNAME)
++	@cp -f ../pcsl_file.h $(OUTPUT_INC_DIR)
++	@cp -f ../pcsl_directory.h $(OUTPUT_INC_DIR)
++
++include $(PCSL_DIR)/makefiles/verify.gmk
++
++$(LIBNAME): $(OBJS)
++	@rm -f $(LIBNAME)
++	@$(AR) $(AR_OUTPUT)$(LIBNAME) `$(call fixcygpath, $^)`
++	@ranlib $(LIBNAME)
++
++$(OUTPUT_OBJ_DIR)/phoneme_pcsl_file.o: $(BBK9588_PORT_DIR)/phoneme_pcsl_file.c
++	@$(CC) -I.. -I$(OUTPUT_INC_DIR) $(CFLAGS) $(CC_OUTPUT)$@ \
++	    `$(call fixcygpath, $<)`
++
++$(OUTPUT_OBJ_DIR) $(OUTPUT_LIB_DIR) $(OUTPUT_INC_DIR):
++	@mkdir -p $@
++
++clean: verify
++	rm -f $(OBJS) $(LIBNAME)
++
++.PHONY: all clean verify
+diff --git a/pcsl/makefiles/platforms/linux_mips_gcc.gmk b/pcsl/makefiles/platforms/linux_mips_gcc.gmk
+new file mode 100644
+index 0000000000000000000000000000000000000000..700f83946cfb5abf7d9ef38c7340a026532696d2
+--- /dev/null
++++ b/pcsl/makefiles/platforms/linux_mips_gcc.gmk
+@@ -0,0 +1,16 @@
++# Cross-build PCSL objects for the little-endian MIPS BDA target.  The BDA
++# supplies its own file, network, and print ports at final link time.
++PCSL_OS=linux
++PCSL_CPU=mips
++
++PCSL_CHUNKMEM_IMPL=pcsl_chunkheap
++PCSL_CHUNKMEM_DIR=$(PCSL_DIR)/memory/heap
++
++include $(PCSL_DIR)/makefiles/share/gcc.gmk
++include $(PCSL_DIR)/makefiles/share/linux.gmk
++
++FILE_MODULE=bbk9588
++
++CFLAGS += -EL -march=mips32 -msoft-float -mno-abicalls -G0 -fno-pic \
++    -ffreestanding -fno-builtin -ffunction-sections -fdata-sections \
++    -I$(BBK9588_INCLUDE_DIR) -I$(BBK9588_SDK_INCLUDE_DIR)
+diff --git a/pcsl/memory/memory_port/bbk9588/pcsl_memory_port.c b/pcsl/memory/memory_port/bbk9588/pcsl_memory_port.c
+new file mode 100644
+index 0000000000000000000000000000000000000000..8e524c637f40ce2bf6ded2d2e40c9e439712ab21
+--- /dev/null
++++ b/pcsl/memory/memory_port/bbk9588/pcsl_memory_port.c
+@@ -0,0 +1,7 @@
++#include <pcsl_memory_port.h>
++
++void *pcsl_heap_allocate_port_impl(long size, long *outSize) {
++    void *pointer = malloc((unsigned long)size);
++    *outSize = pointer == 0 ? 0 : size;
++    return pointer;
++}
+diff --git a/pcsl/memory/memory_port/bbk9588/pcsl_memory_port_impl.h b/pcsl/memory/memory_port/bbk9588/pcsl_memory_port_impl.h
+new file mode 100644
+index 0000000000000000000000000000000000000000..1e8e496a9921a336dfa3d4b8c4b2fbe3b7942a9a
+--- /dev/null
++++ b/pcsl/memory/memory_port/bbk9588/pcsl_memory_port_impl.h
+@@ -0,0 +1,24 @@
++#ifndef _PCSL_MEMORY_PORT_IMPL_H_
++#define _PCSL_MEMORY_PORT_IMPL_H_
++
++#include <stdlib.h>
++#include <string.h>
++
++#ifdef __cplusplus
++extern "C" {
++#endif
++
++void *pcsl_heap_allocate_port_impl(long size, long *outSize);
++
++#define pcsl_heap_deallocate_port_impl(x) free((x))
++#define pcsl_malloc_port_impl(x) malloc((x))
++#define pcsl_free_port_impl(x) free((x))
++#define pcsl_realloc_port_impl(x,y) realloc((x),(y))
++#define pcsl_calloc_port_impl(x,y) calloc((x),(y))
++#define pcsl_strdup_port_impl(x) strdup((x))
++
++#ifdef __cplusplus
++}
++#endif
++
++#endif
+diff --git a/pcsl/types/linux_mips_gcc/java_types_md.h b/pcsl/types/linux_mips_gcc/java_types_md.h
+new file mode 100644
+index 0000000000000000000000000000000000000000..5744c9ffa0c02c3e9dc3e1ee8699375330a17f25
+--- /dev/null
++++ b/pcsl/types/linux_mips_gcc/java_types_md.h
+@@ -0,0 +1,17 @@
++#if !defined _JAVA_TYPES_H_
++# error "Never include <java_types_md.h> directly; use <java_types.h> instead."
++#endif
++
++#ifndef _JAVA_TYPES_MD_H_
++#define _JAVA_TYPES_MD_H_
++
++#ifndef _JAVASOFT_JNI_H_
++typedef signed char jbyte;
++typedef unsigned short jchar;
++typedef int jint;
++typedef long long jlong;
++#endif
++
++#define PCSL_LLD "%lld"
++
++#endif
+diff --git a/preverifier/src/file.c b/preverifier/src/file.c
+index bfe1dd65f6df9d5b6c41af4e24f6585f819a20e7..e6893b43af597017f877c9d35a98547e4e451b96 100644
+--- a/preverifier/src/file.c
++++ b/preverifier/src/file.c
+@@ -586,7 +586,7 @@ void ensure_dir_writable(char *dir)
+     struct stat stat_buf;
+ 
+     stat(dir, &stat_buf);
+-    if ((stat_buf.st_mode & S_IFMT) == S_IFDIR) { /* is dir ? */
++    if (S_ISDIR(stat_buf.st_mode)) { /* is dir ? */
+ #ifdef WIN32
+         if (access(dir, 06) < 0) {
+ #endif
+diff --git a/preverifier/src/jar_support.c b/preverifier/src/jar_support.c
+index b4b0ce4ebe87fa484ae32be973949538ce54a196..a9bb45e6dbb68f7f4c5bf11cc13ee6bcf2262459 100644
+--- a/preverifier/src/jar_support.c
++++ b/preverifier/src/jar_support.c
+@@ -768,7 +768,7 @@ ReadFromZip(zip_t *entry)
+                      * And this is not a directory.
+                      */
+ 
+-                    if ((status < 0) || !(stat_buf.st_mode & S_IFDIR)) {
++                    if ((status < 0) || !S_ISDIR(stat_buf.st_mode)) {
+ 
+                         if (JAR_DEBUG && verbose)
+                             jio_fprintf(stderr,
+@@ -907,7 +907,7 @@ static void remove_dir(char *dirname, char *pkgname)
+ 
+         status = stat(buf, &stat_buf);
+ 
+-        if ((status == 0) && !(stat_buf.st_mode & S_IFDIR)) {
++        if ((status == 0) && !S_ISDIR(stat_buf.st_mode)) {
+             /* remove if this is a file and not a directory */
+ 
+             if (JAR_DEBUG && verbose)
+@@ -926,7 +926,7 @@ static void remove_dir(char *dirname, char *pkgname)
+             stat(buf, &stat_buf);
+             len = strlen(buf);
+ 
+-            if (stat_buf.st_mode & S_IFDIR) {
++            if (S_ISDIR(stat_buf.st_mode)) {
+                 /* handle the recursive directory found */
+ 
+                 sprintf(tmpbuf, "%s%c", buf, (char)LOCAL_DIR_SEPARATOR);
+diff --git a/preverifier/src/main.c b/preverifier/src/main.c
+index aa36b27943ce52237829e1c620440986faeb56c6..2d7409a13547c276faf1ad7d676782fecda640e1 100644
+--- a/preverifier/src/main.c
++++ b/preverifier/src/main.c
+@@ -121,7 +121,7 @@ static void recurse_dir(char *dirname, char *pkgname)
+         stat(buf, &stat_buf);
+         len = strlen(buf);
+ 
+-        if (stat_buf.st_mode & S_IFDIR) {
++        if (S_ISDIR(stat_buf.st_mode)) {
+             /* handle the recursive directory found */
+             strcat(buf, "/");
+             if (JAR_DEBUG && verbose)
+@@ -188,12 +188,11 @@ static void ProcessInputs(char *argname)
+     int res = stat(argname, &stat_buf);
+     int len;
+ 
+-
+     strcpy(buf, argname);
+     len = strlen(argname);
+ 
+ 
+-    if ((res == 0) && (stat_buf.st_mode & S_IFDIR)) {
++    if ((res == 0) && S_ISDIR(stat_buf.st_mode)) {
+         /* Append dir separator if it does not yet exist. */
+         if (buf[len - 1] != LOCAL_DIR_SEPARATOR &&
+         buf[len - 1] != DIR_SEPARATOR) {
+diff --git a/preverifier/src/sys_support.c b/preverifier/src/sys_support.c
+index 4713e42b67ec65b8b2164daaa7f2147946c90807..2e70f8421e9eccb4d543a5e3f3e4b3f3102ef254 100644
+--- a/preverifier/src/sys_support.c
++++ b/preverifier/src/sys_support.c
+@@ -119,7 +119,7 @@ sysGetClassPath(void)
+             }
+             if (stat(path, &sbuf) < 0) {
+                 /* we don't have to do anything */
+-            } else if (sbuf.st_mode & S_IFDIR) {
++            } else if (S_ISDIR(sbuf.st_mode)) {
+                 /* this is a directory */
+                 cpe->type = CPE_DIR;
+                 cpe->u.dir = path;
+diff --git a/tools/configurator/xsl/cldc/propertiesNative.xsl b/tools/configurator/xsl/cldc/propertiesNative.xsl
+index a56cd25bc44eab135c7d58ad2f1e38ed8cf54fe8..d468c6fc46d6ae6c01dd4b46ce6b484a2a0ecfcc 100644
+--- a/tools/configurator/xsl/cldc/propertiesNative.xsl
++++ b/tools/configurator/xsl/cldc/propertiesNative.xsl
+@@ -32,7 +32,7 @@
+ <xsl:output method="text"/>
+ 
+ <xsl:template match="/">
+-<xsl:variable name="properties" select="/configuration/properties"/>
++<xsl:variable name="properties" select="/configuration/properties/property"/>
+ <xsl:call-template name="outputProperties">
+ <xsl:with-param name="properties" select="$properties"/>
+ </xsl:call-template> 
+@@ -41,11 +41,11 @@
+ <xsl:template name="outputProperties">
+ <xsl:param name="properties"/>
+ <!-- all properties with internal scope -->
+-<xsl:variable name="internalProps" select="$properties/property[@Scope = 'internal']"/>
++<xsl:variable name="internalProps" select="$properties[@Scope = 'internal']"/>
+ <!-- all properties with system scope -->
+-<xsl:variable name="systemProps" select="$properties/property[@Scope = 'system']"/>
++<xsl:variable name="systemProps" select="$properties[@Scope = 'system']"/>
+ <!-- all properties with Callout attribute -->
+-<xsl:variable name="calloutProps" select="$properties/property[boolean(@Callout)]"/>
++<xsl:variable name="calloutProps" select="$properties[boolean(@Callout)]"/>
+ <xsl:text>
+ /*
+  * midpConfigurationData.h
+@@ -83,33 +83,53 @@
+ 
+ <!-- output array of properties with internal scope keys -->
+ static const char* internalKey[] = {
+-<xsl:call-template name="outputKeys">
+-<xsl:with-param name="nodes" select="$internalProps"/>
+-</xsl:call-template>NULL};
++<xsl:for-each select="$internalProps">
++<xsl:sort select="@Key"/>
++<xsl:text>    "</xsl:text><xsl:value-of select="@Key"/><xsl:text>",
++</xsl:text>
++</xsl:for-each>NULL};
+ 
+ <!-- output array of properties with internal scope values -->
+ static char* internalValue[] = {
+-<xsl:call-template name="outputValues">
+-<xsl:with-param name="nodes" select="$internalProps"/>
+-</xsl:call-template>NULL};
++<xsl:for-each select="$internalProps">
++<xsl:sort select="@Key"/>
++<xsl:text>    </xsl:text>
++<xsl:choose>
++    <xsl:when test="@Value = ''">NULL</xsl:when>
++    <xsl:otherwise><xsl:text>"</xsl:text><xsl:value-of select="@Value"/><xsl:text>"</xsl:text></xsl:otherwise>
++</xsl:choose>
++<xsl:text>,
++</xsl:text>
++</xsl:for-each>NULL};
+ 
+ <!-- output array of properties with system scope keys -->
+ static const char* systemKey[] = {
+-<xsl:call-template name="outputKeys">
+-<xsl:with-param name="nodes" select="$systemProps"/>
+-</xsl:call-template>NULL};
++<xsl:for-each select="$systemProps">
++<xsl:sort select="@Key"/>
++<xsl:text>    "</xsl:text><xsl:value-of select="@Key"/><xsl:text>",
++</xsl:text>
++</xsl:for-each>NULL};
+ 
+ <!-- output array of properties with system scope values -->
+ static char* systemValue[] = {
+-<xsl:call-template name="outputValues">
+-<xsl:with-param name="nodes" select="$systemProps"/>
+-</xsl:call-template>NULL};
++<xsl:for-each select="$systemProps">
++<xsl:sort select="@Key"/>
++<xsl:text>    </xsl:text>
++<xsl:choose>
++    <xsl:when test="@Value = ''">NULL</xsl:when>
++    <xsl:otherwise><xsl:text>"</xsl:text><xsl:value-of select="@Value"/><xsl:text>"</xsl:text></xsl:otherwise>
++</xsl:choose>
++<xsl:text>,
++</xsl:text>
++</xsl:for-each>NULL};
+ 
+ <!-- output array of callout keys -->
+ static char* calloutKey[] = {
+-<xsl:call-template name="outputKeys">
+-<xsl:with-param name="nodes" select="$calloutProps"/>
+-</xsl:call-template>NULL};
++<xsl:for-each select="$calloutProps">
++<xsl:sort select="@Key"/>
++<xsl:text>    "</xsl:text><xsl:value-of select="@Key"/><xsl:text>",
++</xsl:text>
++</xsl:for-each>NULL};
+ 
+ <!-- output callout functions declarations -->
+ <xsl:for-each select="$calloutProps">
+@@ -121,9 +141,11 @@ static char* calloutKey[] = {
+ <!-- output array of pointers to callout functions -->
+ typedef char* (*CALLOUTPTR)();
+ static CALLOUTPTR calloutFunction[] = {
+-<xsl:call-template name="outputCalloutFunctions">
+-<xsl:with-param name="nodes" select="$calloutProps"/>
+-</xsl:call-template>NULL};
++<xsl:for-each select="$calloutProps">
++<xsl:sort select="@Key"/>
++<xsl:text>    </xsl:text><xsl:value-of select="@Callout"/><xsl:text>,
++</xsl:text>
++</xsl:for-each>NULL};
+ 
+ #endif
+ </xsl:template>
+diff --git a/tools/configurator/xsl/share/merge.xsl b/tools/configurator/xsl/share/merge.xsl
+index 8e50717374e286a17da84fdd4c2695103dd776f5..fecfe208ca8f94be40a336add532b7fd5e876b75 100644
+--- a/tools/configurator/xsl/share/merge.xsl
++++ b/tools/configurator/xsl/share/merge.xsl
+@@ -148,14 +148,20 @@
+ <xsl:template match="constant_class | localized_strings" mode="joinClasses">
+     <!-- name of the class to which this node maps to -->
+     <xsl:variable name="className" select="concat(@Package,'.',@Name)"/>
++    <xsl:variable name="configurationRoot" select="ancestor::configuration[1]"/>
++    <xsl:variable name="classNodes"
++        select="$configurationRoot/constants/constant_class[
++                    concat(@Package,'.',@Name)=$className]
++                | $configurationRoot/localized_strings[
++                    concat(@Package,'.',@Name)=$className]"/>
+     <!-- if we havent seen this class name yet -->
+-    <xsl:if test="generate-id()=generate-id(key('classesNodes', $className)[1])">
++    <xsl:if test="generate-id()=generate-id($classNodes[1])">
+         <!-- output matched node -->
+         <xsl:copy>
+             <!-- output all matched node attributes -->
+             <xsl:copy-of select="@*"/>
+             <!-- for each child of nodes with same class name -->
+-            <xsl:for-each select="key('classesNodes', $className)/child::*">
++            <xsl:for-each select="$classNodes/child::*">
+                 <!-- output child node -->
+                 <xsl:apply-templates select="." mode="joinClasses"/>
+             </xsl:for-each>
+@@ -228,11 +234,12 @@
+     mode="assignKeysValues">
+ 
+     <xsl:variable name="nodeName" select="name(.)"/>
+-    <xsl:variable name="nodePackage" select="./@Package"/>
+-    <xsl:variable name="nodeClass" select="./@Name"/>
++    <xsl:variable name="nodePackage" select="string(./@Package)"/>
++    <xsl:variable name="nodeClass" select="string(./@Name)"/>
+ 
+     <!-- name of the constants class that provides keys values -->
+     <xsl:variable name="keysClassName" select="@KeysClass"/>
++    <xsl:variable name="configurationRoot" select="ancestor::configuration[1]"/>
+ 
+     
+     <!-- 
+@@ -241,8 +248,11 @@
+     -->
+     
+     <!-- nodes providing keys values for this relationship -->
+-    <xsl:variable name="keysValuesNodes" 
+-        select="/configuration/constants/constant_class[$keysClassName=concat(
++    <!-- XSLTC in modern JDKs evaluates xsl:key against the original source
++         document instead of this pass' temporary result tree.  Use direct
++         XPath lookups so the archived build also works with JDK 6+. -->
++    <xsl:variable name="keysValuesNodes"
++        select="$configurationRoot/constants/constant_class[$keysClassName=concat(
+         @Package,'.',@Name)]/constant"/>
+ 
+     <!-- for each key -->
+@@ -251,8 +261,14 @@
+         <xsl:variable name="keyName" select="concat($keysClassName,'.',@Name)"/>
+         
+         <!-- nodes that use this key (refer to it) -->
+-        <xsl:variable name="keyUsersNodes" 
+-        select="key('keysUsersNodes', concat($nodePackage,'.',$nodeClass,':',$keyName))"/>
++        <xsl:variable name="keyConstantName" select="@Name"/>
++        <xsl:variable name="keyUsersNodes"
++        select="$configurationRoot/localized_strings/child::*[
++                    string(../@Package)=$nodePackage and string(../@Name)=$nodeClass and
++                    ../@KeysClass=$keysClassName and @Key=$keyConstantName]
++                | $configurationRoot/skin/skin_properties/child::*[
++                    string(../@Package)=$nodePackage and string(../@Name)=$nodeClass and
++                    ../@KeysClass=$keysClassName and @Key=$keyConstantName]"/>
+     
+         <!-- error: this key is not used -->
+         <xsl:if test="count($keyUsersNodes)=0">
+@@ -281,8 +297,11 @@ is used more than once in '<xsl:value-of select="$nodeName"/>'
+                 select="concat($keysClassName,'.',@Key)"/>
+         
+             <!-- constant nodes providing value for this key -->
+-            <xsl:variable name="keyValueNodes" 
+-                select="key('keysValuesNodes', $keyName)"/>
++            <xsl:variable name="keyConstantName" select="@Key"/>
++            <xsl:variable name="keyValueNodes"
++                select="$configurationRoot/constants/constant_class[
++                    concat(@Package,'.',@Name)=$keysClassName]/constant[
++                    @Name=$keyConstantName]"/>
+     
+             <!-- error: there is no constant corresponding to this key -->
+             <xsl:if test="count($keyValueNodes)=0">
+@@ -324,4 +343,3 @@ corresponding to key '<xsl:value-of select="@Key"/>'
+ 
+ 
+ </xsl:stylesheet>
+-

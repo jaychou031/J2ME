@@ -1,0 +1,150 @@
+# XcodeGen 工程定义 —— BBK 9588 J2ME / iOS
+#
+# 为什么用 XcodeGen：
+#   1) 你没有 Mac，无法用 Xcode 图形界面维护 .xcodeproj；
+#   2) .pbxproj 是难以审阅/合并的 plist，纯文本 yml 更适合放进 GitHub 由 Actions 生成；
+#   3) CI 里 `xcodegen generate` 即可，不需要把 .xcodeproj 提交进仓库。
+#
+# 生成：  xcodegen generate --spec ios/project.yml --project ios/BBK9588J2ME.xcodeproj
+# 注意：  spec 路径里的相对路径都是相对 project.yml 所在目录（ios/）。
+
+name: BBK9588J2ME
+
+options:
+  bundleIdPrefix: cn.bbkclyde.j2me
+  deploymentTarget:
+    iOS: "15.0"
+  xcodeVersion: "13.0"
+  groupSortPosition: top
+  developmentLanguage: zh-Hans
+  # 不把 .xcodeproj 提交进仓库，CI 每次生成
+  createIntermediateGroups: true
+
+configs:
+  Debug: debug
+  Release: release
+
+settings:
+  base:
+    PRODUCT_NAME: BBK9588J2ME
+    PRODUCT_BUNDLE_IDENTIFIER: cn.bbkclyde.j2me.ios
+    IPHONEOS_DEPLOYMENT_TARGET: "15.0"
+    TARGETED_DEVICE_FAMILY: "1,2"
+    SUPPORTED_PLATFORMS: iphoneos iphonesimulator
+    # iPhone 13 是 arm64；同时保留模拟器 arm64/x86_64 以便 CI 做快速烟测
+    ARCHS: arm64
+    ARCHS[sdk=iphonesimulator*]: arm64 x86_64
+    ONLY_ACTIVE_ARCH: NO
+    ENABLE_BITCODE: NO
+    CLANG_ENABLE_MODULES: YES
+    CLANG_ENABLE_OBJC_ARC: YES
+    CLANG_C_LANGUAGE_STANDARD: c11
+    CLANG_CXX_LANGUAGE_STANDARD: c++11
+    GCC_PREPROCESSOR_DEFINITIONS:
+      - "J2ME_SCREEN_WIDTH=240"
+      - "J2ME_SCREEN_HEIGHT=320"
+      - "J2ME_USE_PHONEME_KERNEL=$(J2ME_USE_PHONEME_KERNEL)"
+    # 由命令行/ xcconfig 覆盖的两个注入点：
+    #   J2ME_USE_PHONEME_KERNEL=0 -> 内置诊断内核（默认，保证工程随时可编译可安装）
+    #   J2ME_USE_PHONEME_KERNEL=1 -> 链接 CI 编译出来的 libphoneme_ios.a
+    J2ME_USE_PHONEME_KERNEL: "0"
+    J2ME_EXTRA_LDFLAGS: ""
+    J2ME_EXTRA_LIB_SEARCH_PATHS: ""
+    J2ME_EXTRA_HEADER_SEARCH_PATHS: ""
+    OTHER_LDFLAGS:
+      - "$(inherited)"
+      - "$(J2ME_EXTRA_LDFLAGS)"
+      # phoneME / C++ 与 zlib（JAR/ZIP 规范化需要）
+      - "-lc++"
+      - "-lz"
+      - "-framework"
+      - "AudioToolbox"
+      - "-framework"
+      - "AVFoundation"
+      - "-framework"
+      - "UIKit"
+      - "-framework"
+      - "Foundation"
+      - "-framework"
+      - "CoreGraphics"
+      - "-framework"
+      - "QuartzCore"
+      - "-framework"
+      - "MobileCoreServices"
+      - "-framework"
+      - "UniformTypeIdentifiers"
+    LIBRARY_SEARCH_PATHS:
+      - "$(inherited)"
+      - "$(J2ME_EXTRA_LIB_SEARCH_PATHS)"
+    HEADER_SEARCH_PATHS:
+      - "$(inherited)"
+      - "$(SRCROOT)/App"
+      - "$(SRCROOT)/Platform"
+      - "$(SRCROOT)/Kernel"
+      - "$(J2ME_EXTRA_HEADER_SEARCH_PATHS)"
+    INFOPLIST_FILE: "$(SRCROOT)/Info.plist"
+    CODE_SIGN_ENTITLEMENTS: "$(SRCROOT)/J2ME.entitlements"
+    ASSETCATALOG_COMPILER_APPICON_NAME: AppIcon
+    CURRENT_PROJECT_VERSION: "1"
+    MARKETING_VERSION: "0.1.0"
+    CODE_SIGNING_REQUIRED: NO
+    CODE_SIGNING_ALLOWED: NO   # CI 产出未签名 .app；签名由 scripts/sign-ipa.sh 单独做
+  configs:
+    # 注意：XcodeGen 对同名 setting 采用「configuration 覆盖 base」而不是数组追加，
+    # 所以这里必须把 base 的宏完整重列一遍，否则 240×320 与内核开关会丢失。
+    Debug:
+      GCC_OPTIMIZATION_LEVEL: "0"
+      GCC_PREPROCESSOR_DEFINITIONS:
+        - "DEBUG=1"
+        - "J2ME_SCREEN_WIDTH=240"
+        - "J2ME_SCREEN_HEIGHT=320"
+        - "J2ME_USE_PHONEME_KERNEL=$(J2ME_USE_PHONEME_KERNEL)"
+    Release:
+      GCC_OPTIMIZATION_LEVEL: "s"
+      GCC_PREPROCESSOR_DEFINITIONS:
+        - "NDEBUG=1"
+        - "J2ME_SCREEN_WIDTH=240"
+        - "J2ME_SCREEN_HEIGHT=320"
+        - "J2ME_USE_PHONEME_KERNEL=$(J2ME_USE_PHONEME_KERNEL)"
+
+targets:
+  BBK9588J2ME:
+    type: application
+    platform: iOS
+    sources:
+      - path: App
+        type: group
+      - path: Platform
+        type: group
+      - path: Kernel
+        type: group
+        excludes:
+          - "**/lib/**"
+      - path: Resources
+        type: group
+        buildPhase: resources
+      - path: Assets.xcassets
+        type: group
+        buildPhase: resources
+      - path: Info.plist
+        buildPhase: none
+        optional: true
+    dependencies: []
+    preBuildScripts:
+      - name: "J2ME: 校验内嵌资源"
+        script: |
+          set -e
+          for f in unifont-cjk-14x14.bin phoneme-skin.bin j2me-coffee.png; do
+            if [ ! -f "${SRCROOT}/Resources/$f" ]; then
+              echo "error: 缺少原项目资源 Resources/$f" >&2
+              exit 1
+            fi
+          done
+          echo "J2ME resources OK (CJK 766812 bytes expected)"
+    postBuildScripts: []
+    scheme:
+      testTargets: []
+      gatherCoverageData: false
+      coverageTargets: []
+    # 方向在 Info.plist 的 UISupportedInterfaceOrientations 中声明
+    # （iOS 以 Info.plist 为准，不依赖 build setting）。
