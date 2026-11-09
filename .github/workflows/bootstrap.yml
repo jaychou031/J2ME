@@ -1,6 +1,9 @@
-# 用这段内容【替换】仓库里已有的 .github/workflows/bootstrap.yml
-# 修复：GITHUB_TOKEN 不允许推送 .github/workflows/ 下的文件，
-#       所以不再「铺开后派发」，改成本 workflow 解压后直接编译出 IPA。
+# 用这段内容【整段替换】仓库里的 .github/workflows/bootstrap.yml
+# 变更：
+#   1) macos-14 runner 已退役 -> macos-15
+#   2) 就地修正仓库内 build-app.sh 的 xcodegen --project 用法（幂等，只改一次）
+#   3) 任何步骤失败，自动把错误筛选出来写进本次 run 的 Summary 页，
+#      并把完整日志传成 artifact —— 不用点进流程里翻日志、截图
 name: J2ME iOS 构建
 on: [push, workflow_dispatch]
 permissions:
@@ -10,34 +13,143 @@ jobs:
     runs-on: macos-15
     steps:
       - uses: actions/checkout@v4
-      - name: 展开工程并同步到仓库
+
+      - name: 准备工程
+        shell: bash
         run: |
           set -e
+          mkdir -p build
+          exec > >(tee -a build/00-setup.log) 2>&1
           if [ ! -f ios/project.yml ]; then
             rm -rf /tmp/j2me
             z=$(ls *.zip 2>/dev/null | head -1) || true
             [ -n "$z" ] || { echo "::error::仓库里既没有工程文件也没有 ZIP"; exit 1; }
             unzip -q "$z" -d /tmp/j2me
             cp -a /tmp/j2me/BBK9588-J2ME-iOS/. .
-            rm -f "$z"
-            # GITHUB_TOKEN 不能创建/修改 workflow 文件；本文件已是构建入口
-            rm -f .github/workflows/ios.yml .github/workflows/ios-release.yml
+            rm -f "$z" .github/workflows/ios.yml .github/workflows/ios-release.yml
             chmod +x scripts/*.sh
-            git config user.name  bot
-            git config user.email bot@users.noreply.github.com
-            git add -A
-            git commit -m "展开 J2ME iOS 工程" || true
-            git push origin "HEAD:${GITHUB_REF_NAME}" || echo "::warning::同步失败，不影响本次编译"
           fi
+          # XcodeGen 的 --project 参数是「生成到哪个目录」，不是 .xcodeproj 路径；
+          # 传错会让 project root 错位，报 NSCocoaErrorDomain Code=4 "file doesn't exist"。
+          # 这段幂等修正让仓库里已有的旧版脚本也能就地修好，不用重新上传 ZIP。
+          python3 - <<'PY'
+          p = 'scripts/build-app.sh'
+          s = open(p).read()
+          old = 'xcodegen generate --spec "$ROOT/ios/project.yml" --project "$PROJECT"'
+          new = 'xcodegen generate --spec "$ROOT/ios/project.yml"'
+          if old in s:
+              open(p, 'w').write(s.replace(old, new))
+              print('已修正 build-app.sh：去掉错误的 --project 参数')
+          else:
+              print('build-app.sh 无需修正（已是新版）')
+          PY
+          chmod +x scripts/*.sh
+          git config user.name bot
+          git config user.email bot@users.noreply.github.com
+          git add -A
+          # 双保险：即使仓库里的 .gitignore 缺失，也不把 build/ 日志提交进去
+          git reset -q -- build 2>/dev/null || true
+          git commit -m "展开/修正 J2ME iOS 工程" || true
+          git push origin "HEAD:${GITHUB_REF_NAME}" || echo "::warning::同步失败，不影响本次编译"
+
       - name: 工具链
-        run: bash scripts/check-env.sh
+        shell: bash
+        run: |
+          set -o pipefail
+          bash scripts/check-env.sh 2>&1 | tee build/01-env.log
+
       - name: 编译 App
-        run: bash scripts/build-app.sh
+        shell: bash
+        run: |
+          set -o pipefail
+          bash scripts/build-app.sh 2>&1 | tee build/02-build.log
+
       - name: 打包 IPA
-        run: bash scripts/package-ipa.sh build/J2ME-unsigned.ipa
+        shell: bash
+        run: |
+          set -o pipefail
+          bash scripts/package-ipa.sh build/J2ME-unsigned.ipa 2>&1 | tee build/03-ipa.log
+
       - name: 校验和
-        run: cd build && shasum -a 256 *.ipa > SHA256SUMS.txt && cat SHA256SUMS.txt
+        shell: bash
+        run: |
+          set -o pipefail
+          cd build
+          shasum -a 256 *.ipa 2>&1 | tee 04-sum.log
+          cp 04-sum.log SHA256SUMS.txt
+
+      - name: 构建报告（失败时自动汇总错误）
+        if: always()
+        shell: bash
+        env:
+          JOB_STATUS: ${{ job.status }}
+          RUN_URL: ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}
+        run: |
+          mkdir -p build
+          PAT='error|failed|failure|fatal|undefined symbol|no such file|cannot find|not supported|build failed|nscocoaerrordomain|clang:|ld:|denied|doesn.t exist|exit code'
+          R=build/BUILD_REPORT.md
+          {
+            if [ "$JOB_STATUS" = "success" ]; then
+              echo "## ✅ 构建成功"
+              echo ""
+              echo "产物在 Artifact \`J2ME-iOS-IPA\`。"
+              ls -lh build/*.ipa 2>/dev/null | sed 's/^/- /'
+              sed 's/^/- sha256: /' build/SHA256SUMS.txt 2>/dev/null
+            else
+              echo "## ❌ 构建失败 · 错误摘要（自动生成）"
+              echo ""
+              echo "runner=\`macos-15\` · [本次 run](${RUN_URL})"
+              echo ""
+              echo "### ① 命中的错误行（按步骤分组）"
+              echo '```text'
+              for f in build/0*.log; do
+                [ -s "$f" ] || continue
+                echo "--- $(basename "$f") ---"
+                grep -nEi "$PAT" "$f" | head -20 || echo "(无匹配)"
+              done
+              echo '```'
+              echo ""
+              echo "### ② 首个错误附近的原始上下文（前 20 / 后 40 行）"
+              echo '```text'
+              FF=$(grep -lEi "$PAT" build/0*.log 2>/dev/null | head -1 || true)
+              if [ -n "$FF" ]; then
+                LN=$(grep -nEi "$PAT" "$FF" | head -1 | cut -d: -f1)
+                S=$(( LN > 20 ? LN - 20 : 1 )); E=$(( LN + 40 ))
+                echo "来源: $(basename "$FF") 第 $LN 行"
+                sed -n "${S},${E}p" "$FF"
+              else
+                echo "(没有匹配到错误行，见下方日志尾部)"
+              fi
+              echo '```'
+              echo ""
+              echo "### ③ 各步骤日志末尾 40 行（防止筛选遗漏）"
+              echo '```text'
+              for f in build/0*.log; do
+                [ -s "$f" ] || continue
+                echo "===== $(basename "$f") ====="
+                tail -40 "$f"
+              done
+              echo '```'
+              echo ""
+              echo "> 完整日志见 Artifact \`J2ME-build-logs\`（全部 .log + 本报告）。"
+            fi
+          } | tee "$R" >> "$GITHUB_STEP_SUMMARY"
+          if [ "$JOB_STATUS" != "success" ]; then
+            L=$(grep -hEi "$PAT" build/0*.log 2>/dev/null | head -1 | tr '\n' ' ' | sed 's/%/%25/g')
+            [ -n "$L" ] && echo "::error::$L"
+          fi
+
       - uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: J2ME-build-logs
+          path: |
+            build/*.log
+            build/BUILD_REPORT.md
+          if-no-files-found: warn
+
+      - uses: actions/upload-artifact@v4
+        if: success()
         with:
           name: J2ME-iOS-IPA
           path: |
