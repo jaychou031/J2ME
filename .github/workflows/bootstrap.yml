@@ -1,0 +1,25 @@
+name: 00 Bootstrap
+on: [push, workflow_dispatch]
+permissions: { contents: write, actions: write }
+jobs:
+  b:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          BRANCH: ${{ github.event.repository.default_branch }}
+        run: |
+          set -e
+          z=$(ls *.zip 2>/dev/null | head -1) || true
+          [ -n "$z" ] || exit 0
+          unzip -q "$z" -d t
+          cp -a t/*/. .
+          rm -rf t "$z"
+          chmod +x scripts/*.sh
+          git config user.name  bot
+          git config user.email bot@users.noreply.github.com
+          git add -A
+          git commit -m init || true
+          git push origin "HEAD:$BRANCH"
+          for i in 1 2 3 4 5; do gh workflow run ios.yml --ref "$BRANCH" && break; sleep 3; done
