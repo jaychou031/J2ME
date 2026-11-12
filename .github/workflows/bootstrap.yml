@@ -105,7 +105,20 @@ jobs:
           RUN_URL: ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}
         run: |
           mkdir -p build
-          PAT='error|failed|failure|fatal|undefined symbol|no such file|cannot find|not supported|build failed|nscocoaerrordomain|clang:|ld:|denied|doesn.t exist|exit code'
+          # 只认「诊断行」：error: / fatal: / BUILD FAILED / 链接错误 等。
+          # 旧版用裸 error，把 -Werror=...、export ...=YES_ERROR 这类编译
+          # 命令行也当成错误，head -20 被噪声占满，真正的 error: 反而被挤掉。
+          DIAG='error:|fatal error:|fatal:|undefined symbol|duplicate symbol|Multiple commands produce|BUILD FAILED|CLEAN FAILED|cannot find|No such file|NSCocoaErrorDomain|doesn.t exist|not supported|Assertion failed|Permission denied|command not found|exit code|Code=4|FAILED|failed|ld: |clang: error|xcodebuild: error'
+          NOISE='-Werror|YES_ERROR|export |builtin-|ScanDependencies|ivfsstatcache|SDKStatCaches|common-args|\.resp|Objects-normal|CreateBuildDirectory|ClangStatCache'
+          # 生成 build/diag.txt，每行格式： 日志名:原行号:诊断内容
+          : > build/diag.txt
+          for f in build/0*.log; do
+            [ -s "$f" ] || continue
+            grep -nEi -- "$DIAG" "$f" 2>/dev/null \
+              | grep -vE -- "$NOISE" \
+              | awk -v F="$(basename "$f")" 'length($0) < 600 { print F ":" $0 }' \
+              | cut -c1-400 >> build/diag.txt || true
+          done
           R=build/BUILD_REPORT.md
           {
             if [ "$JOB_STATUS" = "success" ]; then
@@ -119,43 +132,61 @@ jobs:
               echo ""
               echo "runner=\`macos-15\` · [本次 run](${RUN_URL})"
               echo ""
-              echo "### ① 命中的错误行（按步骤分组）"
+              echo "### ⓪ 日志概览（判断失败在哪一步）"
               echo '```text'
               for f in build/0*.log; do
-                [ -s "$f" ] || continue
-                echo "--- $(basename "$f") ---"
-                grep -nEi "$PAT" "$f" | head -20 || echo "(无匹配)"
+                [ -s "$f" ] && echo "$(basename "$f"): $(wc -l < "$f" | tr -d ' ') 行"
               done
               echo '```'
               echo ""
-              echo "### ② 首个错误附近的原始上下文（前 20 / 后 40 行）"
+              echo "### ① 真正的错误行（已过滤编译命令行噪声）"
               echo '```text'
-              FF=$(grep -lEi "$PAT" build/0*.log 2>/dev/null | head -1 || true)
-              if [ -n "$FF" ]; then
-                LN=$(grep -nEi "$PAT" "$FF" | head -1 | cut -d: -f1)
-                S=$(( LN > 20 ? LN - 20 : 1 )); E=$(( LN + 40 ))
-                echo "来源: $(basename "$FF") 第 $LN 行"
-                sed -n "${S},${E}p" "$FF"
+              if [ -s build/diag.txt ]; then
+                N=$(wc -l < build/diag.txt | tr -d ' ')
+                if [ "$N" -gt 80 ]; then
+                  head -40 build/diag.txt
+                  echo "...（中间省略 $((N-80)) 行）..."
+                  tail -40 build/diag.txt
+                else
+                  cat build/diag.txt
+                fi
               else
-                echo "(没有匹配到错误行，见下方日志尾部)"
+                echo "(未命中诊断行，自动附上最后一个日志的末尾 100 行)"
+                LAST=$(ls -t build/0*.log 2>/dev/null | head -1)
+                [ -n "$LAST" ] && tail -100 "$LAST"
               fi
               echo '```'
               echo ""
-              echo "### ③ 各步骤日志末尾 40 行（防止筛选遗漏）"
+              echo "### ② 首个错误附近的原始上下文（前 30 / 后 120 行）"
+              echo '```text'
+              FIRST=$(head -1 build/diag.txt 2>/dev/null || true)
+              if [ -n "$FIRST" ]; then
+                FF=$(echo "$FIRST" | cut -d: -f1)
+                LN=$(echo "$FIRST" | cut -d: -f2)
+                S=$(( LN > 30 ? LN - 30 : 1 )); E=$(( LN + 120 ))
+                echo "来源: build/$FF 第 $LN 行"
+                sed -n "${S},${E}p" "build/$FF"
+              else
+                echo "(见 ① / ③)"
+              fi
+              echo '```'
+              echo ""
+              echo "### ③ 各步骤日志末尾 80 行（防止筛选遗漏）"
               echo '```text'
               for f in build/0*.log; do
                 [ -s "$f" ] || continue
-                echo "===== $(basename "$f") ====="
-                tail -40 "$f"
+                echo "===== $(basename "$f") ($(wc -l < "$f" | tr -d ' ') 行) ====="
+                tail -80 "$f"
               done
               echo '```'
               echo ""
-              echo "> 完整日志见 Artifact \`J2ME-build-logs\`（全部 .log + 本报告）。"
+              echo "> 完整日志见 Artifact \`J2ME-build-logs\`（全部 .log + 诊断清单 + 本报告）。"
+              echo "> 反馈时直接复制 ① 和 ③ 两段文本即可，不用截图、不用下载日志。"
             fi
           } | tee "$R" >> "$GITHUB_STEP_SUMMARY"
           if [ "$JOB_STATUS" != "success" ]; then
-            L=$(grep -hEi "$PAT" build/0*.log 2>/dev/null | head -1 | tr '\n' ' ' | sed 's/%/%25/g')
-            [ -n "$L" ] && echo "::error::$L"
+            L=$(head -1 build/diag.txt 2>/dev/null | cut -c1-300 | tr '\n' ' ' | sed 's/%/%25/g; s/\r/%0D/g')
+            [ -n "$L" ] && echo "::error::$L" || echo "::error::构建失败，详见本次 run 的 Summary 页"
           fi
 
       - uses: actions/upload-artifact@v4
@@ -164,6 +195,7 @@ jobs:
           name: J2ME-build-logs
           path: |
             build/*.log
+            build/diag.txt
             build/BUILD_REPORT.md
           if-no-files-found: warn
 
