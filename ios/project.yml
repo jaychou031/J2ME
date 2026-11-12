@@ -123,9 +123,11 @@ targets:
       - path: Resources
         type: group
         buildPhase: resources
+      # .xcassets 交给 actool 编译，不能按 group 展开
       - path: Assets.xcassets
-        type: group
         buildPhase: resources
+        excludes:
+          - "**/Contents.json"
       - path: Info.plist
         buildPhase: none
         optional: true
