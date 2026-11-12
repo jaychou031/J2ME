@@ -1,8 +1,10 @@
 # 用这段内容【整段替换】仓库里的 .github/workflows/bootstrap.yml
 # 变更：
 #   1) macos-14 runner 已退役 -> macos-15
-#   2) 就地修正仓库内 build-app.sh 的 xcodegen --project 用法（幂等，只改一次）
-#   3) 任何步骤失败，自动把错误筛选出来写进本次 run 的 Summary 页，
+#   2) 就地修正仓库内 build-app.sh 的 xcodegen --project 用法（幂等）
+#   3) 就地修正仓库内 ios/project.yml 的 Assets.xcassets 配置（幂等）
+#      —— 解决 Xcode 16 "Multiple commands produce .../Contents.json"
+#   4) 任何步骤失败，自动把错误筛选出来写进本次 run 的 Summary 页，
 #      并把完整日志传成 artifact —— 不用点进流程里翻日志、截图
 name: J2ME iOS 构建
 on: [push, workflow_dispatch]
@@ -29,19 +31,36 @@ jobs:
             rm -f "$z" .github/workflows/ios.yml .github/workflows/ios-release.yml
             chmod +x scripts/*.sh
           fi
-          # XcodeGen 的 --project 参数是「生成到哪个目录」，不是 .xcodeproj 路径；
-          # 传错会让 project root 错位，报 NSCocoaErrorDomain Code=4 "file doesn't exist"。
-          # 这段幂等修正让仓库里已有的旧版脚本也能就地修好，不用重新上传 ZIP。
+          # ---- 幂等修正：仓库里已有的旧工程也能就地修好，不用重新上传 ZIP ----
           python3 - <<'PY'
+          # 1) build-app.sh：XcodeGen 的 --project 是「生成到哪个目录」，
+          #    传 .xcodeproj 路径会让 project root 错位（NSCocoaErrorDomain Code=4）
           p = 'scripts/build-app.sh'
           s = open(p).read()
           old = 'xcodegen generate --spec "$ROOT/ios/project.yml" --project "$PROJECT"'
           new = 'xcodegen generate --spec "$ROOT/ios/project.yml"'
           if old in s:
               open(p, 'w').write(s.replace(old, new))
-              print('已修正 build-app.sh：去掉错误的 --project 参数')
+              print('[fix] build-app.sh：去掉错误的 --project 参数')
           else:
-              print('build-app.sh 无需修正（已是新版）')
+              print('[fix] build-app.sh：无需修正')
+
+          # 2) project.yml：.xcassets 被 type: group 展开时，目录里 3 个同名
+          #    Contents.json 会一起进 Copy Bundle Resources，Xcode 16 报
+          #    "Multiple commands produce .../Contents.json"。
+          p = 'ios/project.yml'
+          y = open(p).read()
+          bad = '      - path: Assets.xcassets\n        type: group\n        buildPhase: resources\n'
+          good = ('      # .xcassets 交给 actool 编译，不能按 group 展开\n'
+                  '      - path: Assets.xcassets\n'
+                  '        buildPhase: resources\n'
+                  '        excludes:\n'
+                  '          - "**/Contents.json"\n')
+          if bad in y:
+              open(p, 'w').write(y.replace(bad, good))
+              print('[fix] project.yml：消除 Assets.xcassets 的 Contents.json 冲突')
+          else:
+              print('[fix] project.yml：无需修正（已是新版）')
           PY
           chmod +x scripts/*.sh
           git config user.name bot
