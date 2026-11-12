@@ -83,11 +83,16 @@
 
 - (void)importTapped:(id)sender {
     (void)sender;
-    UTType *jarType = [UTType typeWithIdentifier:@"cn.bbkclyde.j2me.jar"];
+    // UniformTypeIdentifiers 并没有导出 UTTypeZIPArchive 这个符号（iOS 15
+    // SDK 上直接报 use of undeclared identifier）；旧 MobileCoreServices 的
+    // kUTTypeZipArchive 也已废弃。统一按 UTI 字符串构造 UTType，零常量依赖。
+    UTType *jarType  = [UTType typeWithIdentifier:@"cn.bbkclyde.j2me.jar"];
+    UTType *zipType  = [UTType typeWithIdentifier:@"public.zip-archive"];
+    UTType *dataType = [UTType typeWithIdentifier:@"public.data"];
     NSMutableArray<UTType *> *types = [NSMutableArray array];
-    if (jarType) [types addObject:jarType];
-    [types addObject:UTTypeZIPArchive];
-    [types addObject:UTTypeData];   /* 兜底：部分系统不认识 .jar 的 UTI */
+    if (jarType)  [types addObject:jarType];   /* Info.plist 里导出的自定义 .jar UTI */
+    if (zipType)  [types addObject:zipType];   /* JAR 本质是 zip 归档 */
+    if (dataType) [types addObject:dataType];  /* 兜底：部分系统不认识 .jar 的 UTI */
     UIDocumentPickerViewController *picker =
         [[UIDocumentPickerViewController alloc]
             initForOpeningContentTypes:types asCopy:YES];
