@@ -6,6 +6,9 @@
 #      —— 解决 Xcode 16 "Multiple commands produce .../Contents.json"
 #   4) 任何步骤失败，自动把错误筛选出来写进本次 run 的 Summary 页，
 #      并把完整日志传成 artifact —— 不用点进流程里翻日志、截图
+#   5) 就地修正 J2MELibraryViewController.m 里不存在的 UTTypeZIPArchive（幂等）
+#      —— 解决 "use of undeclared identifier 'UTTypeZIPArchive'"
+#   6) 错误筛选剔除 "Failed frontend command" 回显，① 首条与 ::error:: 都是真错误
 name: J2ME iOS 构建
 on: [push, workflow_dispatch]
 permissions:
@@ -61,6 +64,34 @@ jobs:
               print('[fix] project.yml：消除 Assets.xcassets 的 Contents.json 冲突')
           else:
               print('[fix] project.yml：无需修正（已是新版）')
+
+          # 3) J2MELibraryViewController.m：UTTypeZIPArchive 并不是
+          #    UniformTypeIdentifiers 导出的符号，iOS 15 SDK 上直接报
+          #    "use of undeclared identifier"；改成按 UTI 字符串构造 UTType。
+          p = 'ios/App/J2MELibraryViewController.m'
+          m = open(p).read()
+          old = ("    UTType *jarType = [UTType typeWithIdentifier:@\"cn.bbkclyde.j2me.jar\"];\n"
+                 "    NSMutableArray<UTType *> *types = [NSMutableArray array];\n"
+                 "    if (jarType) [types addObject:jarType];\n"
+                 "    [types addObject:UTTypeZIPArchive];\n"
+                 "    [types addObject:UTTypeData];   /* 兜底：部分系统不认识 .jar 的 UTI */\n")
+          new = ("    // UniformTypeIdentifiers 并没有导出 UTTypeZIPArchive 这个符号（iOS 15\n"
+                 "    // SDK 上直接报 use of undeclared identifier）；旧 MobileCoreServices 的\n"
+                 "    // kUTTypeZipArchive 也已废弃。统一按 UTI 字符串构造 UTType，零常量依赖。\n"
+                 "    UTType *jarType  = [UTType typeWithIdentifier:@\"cn.bbkclyde.j2me.jar\"];\n"
+                 "    UTType *zipType  = [UTType typeWithIdentifier:@\"public.zip-archive\"];\n"
+                 "    UTType *dataType = [UTType typeWithIdentifier:@\"public.data\"];\n"
+                 "    NSMutableArray<UTType *> *types = [NSMutableArray array];\n"
+                 "    if (jarType)  [types addObject:jarType];   /* Info.plist 里导出的自定义 .jar UTI */\n"
+                 "    if (zipType)  [types addObject:zipType];   /* JAR 本质是 zip 归档 */\n"
+                 "    if (dataType) [types addObject:dataType];  /* 兜底：部分系统不认识 .jar 的 UTI */\n")
+          if old in m:
+              open(p, 'w').write(m.replace(old, new))
+              print('[fix] J2MELibraryViewController.m：去掉不存在的 UTTypeZIPArchive')
+          elif '[types addObject:UTTypeZIPArchive];' in m:
+              print('::warning::仍有 UTTypeZIPArchive 调用但代码形状不同，请检查 importTapped')
+          else:
+              print('[fix] J2MELibraryViewController.m：无需修正（已是新版）')
           PY
           chmod +x scripts/*.sh
           git config user.name bot
@@ -109,7 +140,7 @@ jobs:
           # 旧版用裸 error，把 -Werror=...、export ...=YES_ERROR 这类编译
           # 命令行也当成错误，head -20 被噪声占满，真正的 error: 反而被挤掉。
           DIAG='error:|fatal error:|fatal:|undefined symbol|duplicate symbol|Multiple commands produce|BUILD FAILED|CLEAN FAILED|cannot find|No such file|NSCocoaErrorDomain|doesn.t exist|not supported|Assertion failed|Permission denied|command not found|exit code|Code=4|FAILED|failed|ld: |clang: error|xcodebuild: error'
-          NOISE='-Werror|YES_ERROR|export |builtin-|ScanDependencies|ivfsstatcache|SDKStatCaches|common-args|\.resp|Objects-normal|CreateBuildDirectory|ClangStatCache'
+          NOISE='-Werror|YES_ERROR|export |builtin-|ScanDependencies|ivfsstatcache|SDKStatCaches|common-args|\.resp|Objects-normal|CreateBuildDirectory|ClangStatCache|Failed frontend command'
           # 生成 build/diag.txt，每行格式： 日志名:原行号:诊断内容
           : > build/diag.txt
           for f in build/0*.log; do
