@@ -9,6 +9,8 @@
 #   5) 就地修正 J2MELibraryViewController.m 里不存在的 UTTypeZIPArchive（幂等）
 #      —— 解决 "use of undeclared identifier 'UTTypeZIPArchive'"
 #   6) 错误筛选剔除 "Failed frontend command" 回显，① 首条与 ::error:: 都是真错误
+#   7) 就地修正 scripts/package-ipa.sh：cd 进 STAGE 后相对 OUT 让 zip 无法创建文件（幂等）
+#      —— 解决 "zip error: Could not create output file (build/J2ME-unsigned.ipa)"
 name: J2ME iOS 构建
 on: [push, workflow_dispatch]
 permissions:
@@ -92,6 +94,36 @@ jobs:
               print('::warning::仍有 UTTypeZIPArchive 调用但代码形状不同，请检查 importTapped')
           else:
               print('[fix] J2MELibraryViewController.m：无需修正（已是新版）')
+
+          # 4) package-ipa.sh：workflow 传的 OUT 是相对路径，而脚本会 cd 进
+          #    $STAGE 再调 zip，相对路径被解析到 $STAGE/build/...（目录不存在），
+          #    zip 报 "Could not create output file"。把 OUT 转成绝对路径；
+          #    顺带给 `unzip -l | head` 加 || true，避免 pipefail 下 SIGPIPE 误失败。
+          import re
+          p = 'scripts/package-ipa.sh'
+          s = open(p).read()
+          o1 = 'OUT="${1:-$BUILD/J2ME-unsigned.ipa}"\n\n[ -d "$APP" ]'
+          n1 = ('OUT="${1:-$BUILD/J2ME-unsigned.ipa}"\n'
+                '# $OUT 可能是相对路径（CI 传的是 build/J2ME-unsigned.ipa）。下面会 cd 进\n'
+                '# STAGE 再调 zip，相对路径会被解析成 $STAGE/build/... —— 那个目录不存在，\n'
+                '# zip 会报 "Could not create output file"。统一转成基于 ROOT 的绝对路径。\n'
+                'case "$OUT" in\n'
+                '    /*) ;;\n'
+                '    *) OUT="$ROOT/$OUT" ;;\n'
+                'esac\n'
+                'mkdir -p "$(dirname "$OUT")"\n'
+                'rm -f "$OUT"\n'
+                '\n'
+                '[ -d "$APP" ]')
+          o2 = r'^(unzip -l "\$OUT" \| head -12)$'
+          n2 = r'\1 || true'
+          s2 = s.replace(o1, n1, 1)
+          s2 = re.sub(o2, n2, s2, count=1, flags=re.M)
+          if s2 != s:
+              open(p, 'w').write(s2)
+              print('[fix] package-ipa.sh：OUT 转绝对路径 + pipefail 兜底（修复 zip 无法创建 IPA）')
+          else:
+              print('[fix] package-ipa.sh：无需修正（已是新版）')
           PY
           chmod +x scripts/*.sh
           git config user.name bot
