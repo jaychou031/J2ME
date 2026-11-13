@@ -7,6 +7,15 @@ ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 BUILD="$ROOT/build"
 APP="$BUILD/BBK9588J2ME.app"
 OUT="${1:-$BUILD/J2ME-unsigned.ipa}"
+# $OUT 可能是相对路径（CI 传的是 build/J2ME-unsigned.ipa）。下面会 cd 进
+# STAGE 再调 zip，相对路径会被解析成 $STAGE/build/... —— 那个目录不存在，
+# zip 会报 "Could not create output file"。统一转成基于 ROOT 的绝对路径。
+case "$OUT" in
+    /*) ;;
+    *) OUT="$ROOT/$OUT" ;;
+esac
+mkdir -p "$(dirname "$OUT")"
+rm -f "$OUT"
 
 [ -d "$APP" ] || { echo "[ipa] 缺少 $APP，请先运行 scripts/build-app.sh" >&2; exit 1; }
 
@@ -24,4 +33,4 @@ rm -rf "$STAGE"
 
 echo "[ipa] 未签名 IPA：$OUT ($(wc -c < "$OUT") bytes)"
 echo "[ipa] 校验结构："
-unzip -l "$OUT" | head -12
+unzip -l "$OUT" | head -12 || true
