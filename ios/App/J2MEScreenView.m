@@ -165,10 +165,13 @@
         uint8_t r5 = (uint8_t)((c >> 11) & 0x1fu);
         uint8_t g6 = (uint8_t)((c >> 5) & 0x3fu);
         uint8_t b5 = (uint8_t)(c & 0x1fu);
-        data[i * 4 + 0] = (uint8_t)((r5 << 3) | (r5 >> 2));
-        data[i * 4 + 1] = (uint8_t)((g6 << 2) | (g6 >> 4));
-        data[i * 4 + 2] = (uint8_t)((b5 << 3) | (b5 >> 2));
-        data[i * 4 + 3] = 255u;
+        /* CGBitmapInfo = kCGImageAlphaNoneSkipLast | kCGBitmapByteOrder32Little。
+         * 32 位小端下这个组合的内存布局是 X,B,G,R（byte0 被忽略，byte3 是 R）。
+         * 早期按 R,G,B,255 写入，255 会恒落到 R 通道 -> 整个画面纯红底。 */
+        data[i * 4 + 0] = 0u;                                  /* X：忽略 */
+        data[i * 4 + 1] = (uint8_t)((b5 << 3) | (b5 >> 2));     /* B */
+        data[i * 4 + 2] = (uint8_t)((g6 << 2) | (g6 >> 4));     /* G */
+        data[i * 4 + 3] = (uint8_t)((r5 << 3) | (r5 >> 2));     /* R */
     }
     CGImageRef image = CGBitmapContextCreateImage(_bitmapContext);
     if (image != NULL) {
