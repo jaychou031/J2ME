@@ -1,18 +1,31 @@
 # 用这段内容【整段替换】仓库里的 .github/workflows/bootstrap.yml
 # 变更：
 #   1) macos-14 runner 已退役 -> macos-15
-#   2) 就地修正仓库内 build-app.sh 的 xcodegen --project 用法（幂等）
-#   3) 就地修正仓库内 ios/project.yml 的 Assets.xcassets 配置（幂等）
-#      —— 解决 Xcode 16 "Multiple commands produce .../Contents.json"
-#   4) 任何步骤失败，自动把错误筛选出来写进本次 run 的 Summary 页，
-#      并把完整日志传成 artifact —— 不用点进流程里翻日志、截图
+#   2) 就地修正 build-app.sh 的 xcodegen --project 用法（幂等）
+#   3) 就地修正 ios/project.yml 的 Assets.xcassets 配置（幂等）
+#   4) 任何步骤失败，自动把错误筛选出来写进 Summary + 上传完整日志
 #   5) 就地修正 J2MELibraryViewController.m 里不存在的 UTTypeZIPArchive（幂等）
-#      —— 解决 "use of undeclared identifier 'UTTypeZIPArchive'"
-#   6) 错误筛选剔除 "Failed frontend command" 回显，① 首条与 ::error:: 都是真错误
-#   7) 就地修正 scripts/package-ipa.sh：cd 进 STAGE 后相对 OUT 让 zip 无法创建文件（幂等）
-#      —— 解决 "zip error: Could not create output file (build/J2ME-unsigned.ipa)"
+#   6) 错误筛选剔除 "Failed frontend command" 回显
+#   7) 就地修正 scripts/package-ipa.sh 的相对 OUT 路径（幂等）
+#   8) 【本次】把 phoneME 真内核编译接进 CI：默认尝试、失败自动降级、诊断直达 Summary
+#   9) 【本次】就地修正 J2MEScreenView.m 的 RGB565 字节序（修复整屏纯红）
+#
+# 说明：内核编译是「诊断运行」，continue-on-error，失败照常产出可安装的 IPA。
+# 单次跳过：Actions -> Run workflow -> kernel_backend 选 mock。
+# 永久关闭：把下面两个「尝试...phoneME」步骤的 if 整行改成 `if: false`。
 name: J2ME iOS 构建
-on: [push, workflow_dispatch]
+on:
+  push:
+  workflow_dispatch:
+    inputs:
+      kernel_backend:
+        description: '内核后端：phoneme=尝试从源码编译真内核（默认）；mock=跳过，只出诊断内核 IPA'
+        required: false
+        default: 'phoneme'
+        type: choice
+        options:
+          - phoneme
+          - mock
 permissions:
   contents: write
 jobs:
@@ -124,6 +137,28 @@ jobs:
               print('[fix] package-ipa.sh：OUT 转绝对路径 + pipefail 兜底（修复 zip 无法创建 IPA）')
           else:
               print('[fix] package-ipa.sh：无需修正（已是新版）')
+
+          # 5) J2MEScreenView.m：CGBitmapInfo 是 NoneSkipLast|32Little，
+          #    32 位小端下内存布局为 X,B,G,R（byte0 忽略，byte3 是 R）。
+          #    旧代码按 R,G,B,255 写入 -> 255 恒落到 R 通道 -> 整个画面纯红底。
+          p = 'ios/App/J2MEScreenView.m'
+          v = open(p).read()
+          o = ('        data[i * 4 + 0] = (uint8_t)((r5 << 3) | (r5 >> 2));\n'
+               '        data[i * 4 + 1] = (uint8_t)((g6 << 2) | (g6 >> 4));\n'
+               '        data[i * 4 + 2] = (uint8_t)((b5 << 3) | (b5 >> 2));\n'
+               '        data[i * 4 + 3] = 255u;\n')
+          n = ('        /* CGBitmapInfo = kCGImageAlphaNoneSkipLast | kCGBitmapByteOrder32Little。\n'
+               '         * 32 位小端下这个组合的内存布局是 X,B,G,R（byte0 被忽略，byte3 是 R）。\n'
+               '         * 早期按 R,G,B,255 写入，255 会恒落到 R 通道 -> 整个画面纯红底。 */\n'
+               '        data[i * 4 + 0] = 0u;                                  /* X：忽略 */\n'
+               '        data[i * 4 + 1] = (uint8_t)((b5 << 3) | (b5 >> 2));     /* B */\n'
+               '        data[i * 4 + 2] = (uint8_t)((g6 << 2) | (g6 >> 4));     /* G */\n'
+               '        data[i * 4 + 3] = (uint8_t)((r5 << 3) | (r5 >> 2));     /* R */\n')
+          if o in v:
+              open(p, 'w').write(v.replace(o, n, 1))
+              print('[fix] J2MEScreenView.m：按 X,B,G,R 写入，修复整屏纯红')
+          else:
+              print('[fix] J2MEScreenView.m：无需修正（已是新版）')
           PY
           chmod +x scripts/*.sh
           git config user.name bot
@@ -140,11 +175,45 @@ jobs:
           set -o pipefail
           bash scripts/check-env.sh 2>&1 | tee build/01-env.log
 
-      - name: 编译 App
+      # ---- 从源码尝试编译 phoneME 真内核（诊断运行）----
+      # continue-on-error：失败不影响出包；诊断直达 Summary + artifact。
+      - name: 尝试拉取 phoneME 源码并应用 BBK9588 补丁
+        id: phoneme_src
+        if: ${{ github.event_name != 'workflow_dispatch' || inputs.kernel_backend != 'mock' }}
+        continue-on-error: true
+        timeout-minutes: 15
         shell: bash
         run: |
           set -o pipefail
-          bash scripts/build-app.sh 2>&1 | tee build/02-build.log
+          bash scripts/bootstrap-phoneme.sh 2>&1 | tee build/phoneme-src.log
+
+      - name: 尝试编译 phoneME arm64 内核
+        id: kernel
+        if: ${{ (github.event_name != 'workflow_dispatch' || inputs.kernel_backend != 'mock') && steps.phoneme_src.outcome == 'success' }}
+        continue-on-error: true
+        timeout-minutes: 30
+        shell: bash
+        run: |
+          set -o pipefail
+          bash scripts/build-phoneme-ios.sh 2>&1 | tee build/phoneme-kernel.log
+
+      - name: 编译 App
+        shell: bash
+        env:
+          KERNEL_BACKEND: ${{ steps.kernel.outcome == 'success' && 'phoneme' || 'mock' }}
+        run: |
+          set -o pipefail
+          printf '%s\n' "${KERNEL_BACKEND:-mock}" > build/FINAL_BACKEND.txt
+          if bash scripts/build-app.sh 2>&1 | tee build/02-build.log; then
+            exit 0
+          fi
+          if [ "$KERNEL_BACKEND" = "phoneme" ]; then
+            echo "[app] phoneME 库链接失败，自动回退诊断内核重试" | tee -a build/02-build.log
+            printf 'mock\n' > build/FINAL_BACKEND.txt
+            KERNEL_BACKEND=mock bash scripts/build-app.sh 2>&1 | tee -a build/02-build.log
+          else
+            exit 1
+          fi
 
       - name: 打包 IPA
         shell: bash
@@ -165,6 +234,7 @@ jobs:
         shell: bash
         env:
           JOB_STATUS: ${{ job.status }}
+          KERNEL_OUTCOME: ${{ steps.kernel.outcome }}
           RUN_URL: ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}
         run: |
           mkdir -p build
@@ -190,6 +260,14 @@ jobs:
               echo "产物在 Artifact \`J2ME-iOS-IPA\`。"
               ls -lh build/*.ipa 2>/dev/null | sed 's/^/- /'
               sed 's/^/- sha256: /' build/SHA256SUMS.txt 2>/dev/null
+              echo ""
+              FINAL=$(cat build/FINAL_BACKEND.txt 2>/dev/null || echo mock)
+              if [ "$FINAL" = "phoneme" ]; then
+                echo "- **phoneME 真内核：编译并链接成功，本次 IPA 已使用真内核**"
+              else
+                echo "- **phoneME 真内核：未接通，本次 IPA 仍是诊断内核（不执行 Java 字节码，仍不能跑 jar 游戏）**"
+                echo "- 失败原因见下方「phoneME 真内核 · 首次可行性诊断」，或 Artifact \`J2ME-phoneme-kernel\`"
+              fi
             else
               echo "## ❌ 构建失败 · 错误摘要（自动生成）"
               echo ""
@@ -252,6 +330,129 @@ jobs:
             [ -n "$L" ] && echo "::error::$L" || echo "::error::构建失败，详见本次 run 的 Summary 页"
           fi
 
+      - name: 内核可行性诊断（写进 Summary）
+        if: always()
+        shell: bash
+        env:
+          SRC_OUTCOME: ${{ steps.phoneme_src.outcome }}
+          KERNEL_OUTCOME: ${{ steps.kernel.outcome }}
+          RUN_URL: ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}
+        run: |
+          mkdir -p build
+          R=build/KERNEL_REPORT.md
+          PAT='FATAL|error:|fatal error|未找到|失败|缺少符号|No such file|not found|romize|ROMImage|input_port|undefined symbol|GNUmakefile|java_home|JDK'
+          NOISE='-Werror|ScanDependencies|builtin-|export |YES_ERROR|ClangStatCache'
+          {
+            echo "## 🧪 phoneME 真内核 · 首次可行性诊断"
+            echo ""
+            echo "runner=\`macos-15\` · [本次 run](${RUN_URL})"
+            echo ""
+            echo "| 环节 | 结果 |"
+            echo "| --- | --- |"
+            echo "| 拉取源码 + 应用补丁 | \`$SRC_OUTCOME\` |"
+            echo "| 编译 arm64 内核 | \`$KERNEL_OUTCOME\` |"
+            FINAL=$(cat build/FINAL_BACKEND.txt 2>/dev/null || echo mock)
+            if [ "$FINAL" = "phoneme" ]; then
+              echo "| 本次 IPA 内核 | **phoneME 真内核** |"
+            else
+              echo "| 本次 IPA 内核 | **诊断内核（不执行 Java 字节码，仍不能跑 jar 游戏）** |"
+            fi
+            echo ""
+            echo "> 这一轮的目的**不是一次编译成功**，而是拿回失败报告、判断这条路走不走得通。"
+            echo "> 反馈时直接复制 **① ② ③** 三段文本发我即可，不用截图、不用下载日志。"
+            echo ""
+            echo "### ⓪ 环境事实（判断可行性的关键）"
+            echo '```text'
+            echo "uname  : $(uname -a)"
+            echo "xcode  : $(xcodebuild -version 2>/dev/null | tr '\n' ' ')"
+            echo "sdk    : $(xcrun --sdk iphoneos --show-sdk-version 2>/dev/null)"
+            echo "java   : $(java -version 2>&1 | head -1)"
+            echo "javac  : $(javac -version 2>&1 | head -1)"
+            echo "make   : $(make --version 2>&1 | head -1)"
+            echo "源码树 : $([ -d .deps/phoneme/cldc ] && echo 已拉取 || echo 未拉取)"
+            if [ -d .deps/phoneme ]; then
+              echo "commit : $(git -C .deps/phoneme rev-parse HEAD 2>/dev/null || echo unknown)"
+              echo "改动数 : $(git -C .deps/phoneme status --porcelain 2>/dev/null | wc -l | tr -d ' ')"
+              for f in \
+                cldc/src/vm/share/runtime/ROMImage.cpp \
+                cldc/src/vm/share/runtime/ROMImage.hpp \
+                midp/src/events/input_port/bbk9588/phoneme_input_port.c \
+                midp/src/events/input_port/bbk9588/lib.gmk \
+                cldc/build/GNUmakefile \
+                midp/build/common/GNUmakefile \
+                midp/build/common/Makefile ; do
+                [ -f ".deps/phoneme/$f" ] && echo "存在  $f" || echo "缺失  $f"
+              done
+              echo "-- romizer / ROMImage 相关文件 --"
+              find .deps/phoneme -iname '*romiz*' 2>/dev/null | head -8
+              find .deps/phoneme -iname '*ROMImage*' 2>/dev/null | head -8
+            fi
+            echo '```'
+            echo ""
+            echo "### ⓪b 工程内文件齐全度 + 上游源码结构"
+            echo '```text'
+            echo "-- 本仓库自带的内核构建文件 --"
+            for f in \
+              scripts/bootstrap-phoneme.sh scripts/build-phoneme-ios.sh \
+              vendor/deps.lock.psd1 vendor/phoneme-feature-mr2-bbk9588.patch \
+              vendor/phoneme_audio.c.orig vendor/phoneme_cjk_text.c.orig \
+              vendor/native_events.c.orig \
+              scripts/ios-kernel-overlay/phoneme_ios_bridge.c \
+              scripts/ios-kernel-overlay/phoneme_ios_bridge.h ; do
+              [ -f "$f" ] && echo "存在  $f ($(wc -c < "$f" | tr -d ' ') B)" || echo "缺失  $f"
+            done
+            if [ -d .deps/phoneme ]; then
+              echo "-- 上游 make 入口 --"
+              find .deps/phoneme -maxdepth 4 \( -name GNUmakefile -o -name Makefile \) 2>/dev/null | head -20
+              echo "-- 已知缺口：input_port/bbk9588 --"
+              ls -1 .deps/phoneme/midp/src/events/input_port/bbk9588/ 2>/dev/null | head -20 || echo "(目录不存在)"
+              echo "-- 补丁是否引用 phoneme_input_port.c --"
+              grep -c 'phoneme_input_port' vendor/phoneme-feature-mr2-bbk9588.patch 2>/dev/null || true
+            else
+              echo "-- 上游源码树未拉取，跳过结构探测 --"
+            fi
+            echo '```'
+            echo ""
+            echo "### ① 脚本自动生成的失败报告"
+            echo '```text'
+            if [ -f build/kernel/BUILD_FAILURE.md ]; then
+              cat build/kernel/BUILD_FAILURE.md
+            else
+              echo "(未生成 BUILD_FAILURE.md —— 说明卡在脚本最早期，或内核编译未尝试)"
+            fi
+            echo '```'
+            echo ""
+            echo "### ② 关键错误行（已去噪，限 60 条）"
+            echo '```text'
+            : > build/kernel-diag.txt
+            for f in build/phoneme-*.log build/kernel/*.log; do
+              [ -s "$f" ] || continue
+              grep -nEi -- "$PAT" "$f" 2>/dev/null \
+                | grep -vE -- "$NOISE" \
+                | awk -v F="$(basename "$f")" 'length($0) < 500 { print F ":" $0 }' \
+                | cut -c1-360 >> build/kernel-diag.txt || true
+            done
+            if [ -s build/kernel-diag.txt ]; then
+              head -60 build/kernel-diag.txt
+            else
+              echo "(未命中；见 ③)"
+            fi
+            echo '```'
+            echo ""
+            echo "### ③ 各内核日志末尾 50 行"
+            echo '```text'
+            for f in build/phoneme-src.log build/phoneme-kernel.log \
+                     build/kernel/compile.log build/kernel/make.log \
+                     build/kernel/PHONEME_MAKE_FAILURE.log build/kernel/symbols.txt; do
+              [ -s "$f" ] || continue
+              echo "===== $(basename "$f") ($(wc -l < "$f" | tr -d ' ') 行) ====="
+              tail -50 "$f"
+            done
+            echo '```'
+            echo ""
+            echo "> 完整内核日志见 Artifact \`J2ME-phoneme-kernel\`（只含文本产物，不含 .o/.a）。"
+          } | tee "$R" >> "$GITHUB_STEP_SUMMARY"
+
       - uses: actions/upload-artifact@v4
         if: always()
         with:
@@ -260,6 +461,21 @@ jobs:
             build/*.log
             build/diag.txt
             build/BUILD_REPORT.md
+            build/kernel-diag.txt
+            build/KERNEL_REPORT.md
+          if-no-files-found: warn
+
+      - uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: J2ME-phoneme-kernel
+          path: |
+            build/kernel/*.log
+            build/kernel/*.md
+            build/kernel/*.txt
+            build/phoneme-*.log
+            build/kernel-diag.txt
+            build/KERNEL_REPORT.md
           if-no-files-found: warn
 
       - uses: actions/upload-artifact@v4
